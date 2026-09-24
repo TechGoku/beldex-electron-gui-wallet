@@ -105,11 +105,8 @@ async function showUpdateDialog(mainWindow) {
     defaultId: LATER_BUTTON,
     cancelId: RESTART_BUTTON
   };
-  return new Promise(resolve => {
-    dialog.showMessageBox(mainWindow, options, response => {
-      resolve(response === RESTART_BUTTON);
-    });
-  });
+  const { response } = await dialog.showMessageBox(mainWindow, options);
+  return response === RESTART_BUTTON;
 }
 
 async function showCannotUpdateDialog(mainWindow) {
@@ -121,11 +118,7 @@ async function showCannotUpdateDialog(mainWindow) {
       "Beldex Electron Wallet failed to update but there is a new version available. Please go to https://beldex.io/ and install the new version manually."
   };
 
-  return new Promise(resolve => {
-    dialog.showMessageBox(mainWindow, options, () => {
-      resolve();
-    });
-  });
+  await dialog.showMessageBox(mainWindow, options);
 }
 
 export { checkForUpdate };

@@ -22,3 +22,11 @@ export const appIpc = {
 export const shell = {
   openExternal: url => electronAPI.shell.openExternal(url)
 };
+
+// File.path was removed in Electron 32
+export const getPathForFile = file =>
+  file ? electronAPI.files.getPathForFile(file) : "";
+
+// Native folder picker (empty string when cancelled)
+export const selectDirectory = defaultPath =>
+  electronAPI.dialog.selectDirectory(defaultPath);

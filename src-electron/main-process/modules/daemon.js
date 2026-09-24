@@ -17,7 +17,14 @@ export class Daemon {
     this.local = false; // do we have a local daemon ?
 
     this.agent = new http.Agent({ keepAlive: true, maxSockets: 100 });
-    this.queue = new queue(1, Infinity);
+    // The daemon serves RPC calls concurrently, so a slow call (e.g. the
+    // master node list) doesn't have to hold up the heartbeat.
+    this.queue = new queue(4, Infinity);
+
+    // Last get_info result, used by the wallet to tell whether it is syncing
+    this.info = null;
+    // Fingerprints of the last data pushed to the renderer
+    this.sent = {};
 
     // Settings for timestamp to height conversion
     // These are initial values used to calculate the height
@@ -59,7 +66,7 @@ export class Daemon {
     });
   }
 
-  checkRemote(daemon) {
+  checkRemote(daemon, timeout = 20000) {
     if (daemon && daemon.type === "local") {
       return Promise.resolve({});
     }
@@ -71,14 +78,32 @@ export class Daemon {
         protocol: "http://",
         hostname: daemon.remote_host,
         port: daemon.remote_port,
-        timeout: 20000
+        timeout
       }
     ).then(data => {
       if (data.error) return { error: data.error };
       return {
-        net_type: data.result.nettype
+        net_type: data.result.nettype,
+        height: data.result.height
       };
     });
+  }
+
+  // Probe all known remotes in parallel and resolve with the first healthy
+  // one on the requested network (null if none answer in time).
+  findWorkingRemote(remotes, net_type, timeout = 8000) {
+    const probes = remotes.map(remote =>
+      this.checkRemote(
+        { type: "remote", remote_host: remote.host, remote_port: remote.port },
+        timeout
+      ).then(data => {
+        if (data.error || data.net_type !== net_type) {
+          throw new Error("unusable remote");
+        }
+        return { ...remote, net_type: data.net_type };
+      })
+    );
+    return Promise.any(probes).catch(() => null);
   }
 
   start(options) {
@@ -106,6 +131,7 @@ export class Daemon {
     }
     return new Promise((resolve, reject) => {
       this.local = true;
+      this.type = daemon.type;
 
       const args = [
         "--data-dir",
@@ -225,7 +251,21 @@ export class Daemon {
               });
             }, 1000);
           } else {
-            reject(new Error(`Local daemon port ${this.port} is in use`));
+            // Usually a beldexd left running by a previous session (it is
+            // spawned detached). Reuse it if it is a healthy node on our
+            // network instead of failing startup.
+            this.sendRPC("get_info", {}, { timeout: 5000 }).then(data => {
+              const nettype = data.result && data.result.nettype;
+              if (!data.error && (!nettype || nettype === net_type)) {
+                process.stderr.write(
+                  `Daemon: reusing beldexd already listening on port ${this.port}\n`
+                );
+                this.startHeartbeat();
+                resolve();
+              } else {
+                reject(new Error(`Local daemon port ${this.port} is in use`));
+              }
+            });
           }
         });
     });
@@ -419,10 +459,36 @@ export class Daemon {
         }
         if (n.method == "get_info") {
           daemon_info.info = n.result;
+          this.info = n.result;
+          this.checkLocalDaemonBehind(n.result);
         }
       }
-      this.sendGateway("set_daemon_data", daemon_info);
+      this.sendIfChanged("info", daemon_info);
     });
+  }
+
+  // A local node that is far behind can't serve the wallet until it has
+  // synced (the wallet then logs out_of_hashchain_bounds errors). Tell the
+  // renderer once so it can offer Local + Remote (bootstrap) mode.
+  checkLocalDaemonBehind(info) {
+    if (!this.local || this.type !== "local" || this.behindNoticeSent) return;
+    const target = info.target_height || 0;
+    const height = info.height || 0;
+    if (target > 0 && target - height > 1000) {
+      this.behindNoticeSent = true;
+      this.sendGateway("local_daemon_behind", {
+        height,
+        target_height: target
+      });
+    }
+  }
+
+  // Skip pushing data the renderer already has
+  sendIfChanged(key, data) {
+    const fingerprint = JSON.stringify(data);
+    if (this.sent[key] === fingerprint) return;
+    this.sent[key] = fingerprint;
+    this.sendGateway("set_daemon_data", data);
   }
 
   heartbeatSlowAction() {
@@ -465,7 +531,7 @@ export class Daemon {
           daemon_info.tx_pool_backlog = n.result.backlog;
         }
       }
-      this.sendGateway("set_daemon_data", daemon_info);
+      this.sendIfChanged("slow", daemon_info);
     });
   }
 
@@ -482,13 +548,21 @@ export class Daemon {
         nodes,
         fetching: false
       };
+      const fingerprint = JSON.stringify(nodes);
+      if (this.sent.master_nodes === fingerprint) {
+        this.sendGateway("set_daemon_data", {
+          master_nodes: { fetching: false }
+        });
+        return;
+      }
+      this.sent.master_nodes = fingerprint;
       this.sendGateway("set_daemon_data", { master_nodes });
     });
 
     this.getRPC("master_node_blacklisted_key_images").then(data => {
       if (!data.hasOwnProperty("result")) return;
       const master_nodes_deregister = data.result.blacklist;
-      this.sendGateway("set_daemon_data", { master_nodes_deregister });
+      this.sendIfChanged("deregister", { master_nodes_deregister });
     });
   }
 
@@ -634,6 +708,8 @@ export class Daemon {
 
   quit() {
     clearInterval(this.heartbeat);
+    clearInterval(this.heartbeat_slow);
+    clearInterval(this.masterNodeHeartbeat);
     return new Promise(resolve => {
       if (this.daemonProcess) {
         this.daemonProcess.on("close", () => {

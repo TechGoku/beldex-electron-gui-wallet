@@ -50,15 +50,9 @@ export class SwapTxnHistory {
     return { transactions, totalCount };
   }
 
-  getTxnExchange(txnId, walletAddress) {
+  getTxnExchange(txnId) {
     if (!txnId) return null;
-    const dbManager = this._getDbManager();
-    if (walletAddress) {
-      const orders = dbManager.getAllOrderHistory(walletAddress);
-      const found = orders.find(t => String(t.txn_id) === String(txnId));
-      if (found && found.exchange) return found.exchange;
-    }
-    const record = dbManager.getTxnById(txnId);
+    const record = this._getDbManager().getTxnById(txnId);
     return record ? record.exchange : null;
   }
 

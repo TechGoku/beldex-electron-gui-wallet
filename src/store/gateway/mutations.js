@@ -1,16 +1,16 @@
-const objectAssignDeep = require("object-assign-deep");
+import { mergeInto } from "./merge";
 
 export const set_app_data = (state, data) => {
-  state.app = objectAssignDeep.noMutate(state.app, data);
+  mergeInto(state.app, data);
 };
 export const set_daemon_data = (state, data) => {
-  state.daemon = objectAssignDeep.noMutate(state.daemon, data);
+  mergeInto(state.daemon, data);
 };
 export const set_wallet_data = (state, data) => {
-  state.wallet = objectAssignDeep.noMutate(state.wallet, data);
+  mergeInto(state.wallet, data);
 };
 export const set_wallet_list = (state, data) => {
-  state.wallets = objectAssignDeep.noMutate(state.wallets, data);
+  mergeInto(state.wallets, data);
 };
 export const set_old_gui_import_status = (state, data) => {
   state.old_gui_import_status = data;
@@ -22,10 +22,13 @@ export const set_sweep_all_status = (state, data) => {
   state.sweep_all_status = data;
 };
 export const set_mnode_status = (state, data) => {
-  state.master_node_status = objectAssignDeep.noMutate(
-    state.master_node_status,
-    data
-  );
+  // Each sub-status gets a fresh object: components watch them and compare
+  // old vs new codes.
+  const next = { ...state.master_node_status };
+  for (const key of Object.keys(data)) {
+    next[key] = { ...(next[key] || {}), ...data[key] };
+  }
+  state.master_node_status = next;
 };
 export const set_prove_transaction_status = (state, data) => {
   state.prove_transaction_status = {

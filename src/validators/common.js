@@ -77,26 +77,53 @@ export const eth_address = input => {
   return /^(0x)?[0-9a-fA-F]{40}$/.test(input);
 };
 
-export const address = (input, gateway) => {
-  // Validate the address
-  return new Promise((resolve, reject) => {
-    if (input.toLowerCase().endsWith(".bdx")) {
-      return resolve();
-    }
-    if (!/^[0-9A-Za-z]+$/.test(input)) return reject();
-    gateway.once("validate_address", data => {
-      if (data.address && data.address !== input) {
-        reject();
-      } else {
-        if (data.valid) {
-          resolve();
-        } else {
-          reject();
-        }
-      }
-    });
+// Addresses already confirmed valid by wallet-rpc (validity never changes)
+const validAddresses = new Set();
+// In-flight checks, so concurrent validators share one RPC call
+const pendingChecks = new Map();
+
+const checkAddress = (input, gateway) => {
+  if (validAddresses.has(input)) return Promise.resolve(true);
+  let pending = pendingChecks.get(input);
+  if (pending) return pending;
+
+  pending = new Promise(resolve => {
+    const finish = valid => {
+      clearTimeout(timer);
+      gateway.removeListener("validate_address", onResult);
+      pendingChecks.delete(input);
+      if (valid) validAddresses.add(input);
+      resolve(valid);
+    };
+    // Responses carry the address, so each check only takes its own answer
+    const onResult = data => {
+      if (data.address === input) finish(!!data.valid);
+    };
+    const timer = setTimeout(() => finish(false), 15000);
+    gateway.on("validate_address", onResult);
     gateway.send("wallet", "validate_address", {
       address: input
     });
   });
+  pendingChecks.set(input, pending);
+  return pending;
+};
+
+export const address = (input, gateway) => {
+  // Validate the address
+  if (input.toLowerCase().endsWith(".bdx")) {
+    return Promise.resolve();
+  }
+  // Standard, sub- and integrated addresses are 95-106 base58 characters;
+  // anything else can be rejected without asking wallet-rpc.
+  if (
+    !/^[0-9A-Za-z]+$/.test(input) ||
+    input.length < 95 ||
+    input.length > 106
+  ) {
+    return Promise.reject();
+  }
+  return checkAddress(input, gateway).then(valid =>
+    valid ? undefined : Promise.reject()
+  );
 };

@@ -83,6 +83,8 @@ export class SwapDatabaseManager {
         ON swap_transactions_history (wallet_address, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_swap_txn_exchange_id 
         ON swap_transactions_history (exchange, txn_id);
+      CREATE INDEX IF NOT EXISTS idx_swap_txn_id
+        ON swap_transactions_history (txn_id);
     `;
 
     const createMetaTable = `

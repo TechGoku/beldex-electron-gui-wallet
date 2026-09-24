@@ -57,7 +57,9 @@ export default {
     };
   },
   computed: {
-    pending_config: state => state.gateway.app.pending_config,
+    pending_config() {
+      return this.$store.state.gateway.app.pending_config;
+    },
     lang() {
       return this.$i18n.locale;
     },
@@ -80,7 +82,7 @@ export default {
     save() {
       const lang = this.langSelect;
 
-      this.$gateway.send("core", "set_language", { lang });
+      this.$gateway.setLanguage(lang);
       this.$emit("select", lang);
 
       this.$gateway.send("core", "save_config", this.pending_config);

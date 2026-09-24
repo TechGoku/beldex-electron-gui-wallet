@@ -268,9 +268,11 @@ export class Backend {
 
     this.token = config.token;
 
+    // Loopback only: the renderer is the sole client.
     this.wss = new WebSocket.Server({
+      host: "127.0.0.1",
       port: config.port,
-      maxPayload: Number.POSITIVE_INFINITY
+      maxPayload: 256 * 1024 * 1024
     });
 
     this.wss.on("connection", ws => {
@@ -279,6 +281,7 @@ export class Backend {
   }
 
   send(event, data = {}) {
+    if (!this.wss || this.wss.clients.size === 0) return;
     let message = {
       event,
       data
@@ -295,8 +298,15 @@ export class Backend {
   }
 
   receive(data) {
-    let decrypted_data = JSON.parse(this.scee.decryptString(data, this.token));
-    // console.log("decrypted_data:", decrypted_data);
+    let decrypted_data;
+    try {
+      decrypted_data = JSON.parse(
+        this.scee.decryptString(data.toString(), this.token)
+      );
+    } catch (error) {
+      console.error("Dropping undecryptable websocket frame");
+      return;
+    }
     // route incoming request to either the daemon, wallet, or here
     switch (decrypted_data.module) {
       case "core":
@@ -551,7 +561,7 @@ export class Backend {
       const updateRequired = updateAvailable && majorOrMinor;
       this.send("set_update_required", updateRequired);
     } catch (e) {
-      this.send("set_updated_required", false);
+      this.send("set_update_required", false);
     }
   }
 
@@ -728,7 +738,36 @@ export class Backend {
 
       // Make sure the remote node provided is accessible
       const config_daemon = this.config_data.daemons[net_type];
-      this.daemon.checkRemote(config_daemon).then(data => {
+      this.daemon.checkRemote(config_daemon).then(async data => {
+        // The configured remote is down: fail over to a working public node
+        // instead of sending the user back to the settings screen.
+        if (
+          data.error &&
+          (config_daemon.type === "remote" ||
+            config_daemon.type === "local_remote")
+        ) {
+          const fallback = await this.daemon.findWorkingRemote(
+            this.remotes.filter(r => r.host !== config_daemon.remote_host),
+            net_type
+          );
+          if (fallback) {
+            config_daemon.remote_host = fallback.host;
+            config_daemon.remote_port = fallback.port;
+            this.writeConfig();
+            this.send("set_app_data", {
+              config: this.config_data,
+              pending_config: this.config_data
+            });
+            this.send("show_notification", {
+              type: "warning",
+              textColor: "black",
+              message: `Remote node unreachable, switched to ${fallback.host}:${fallback.port}`,
+              timeout: 4000
+            });
+            data = { net_type: fallback.net_type };
+          }
+        }
+
         if (data.error) {
           // If we can default to local then we do so, otherwise we tell the user  to re-set the node
           if (config_daemon.type === "local_remote") {
@@ -802,6 +841,9 @@ export class Backend {
             this.daemon
               .start(this.config_data)
               .then(() => {
+                if (this.config_data.daemons[net_type].type === "local") {
+                  this.checkLocalNodeBehind(net_type);
+                }
                 this.send("set_app_data", {
                   status: {
                     code: 6 // Starting wallet
@@ -872,6 +914,40 @@ export class Backend {
           });
       });
     });
+  }
+
+  // Compare the local node with a public node. Unlike the node's own
+  // target_height this also works before it has found any peers.
+  async checkLocalNodeBehind(net_type) {
+    try {
+      const remote = await this.daemon.findWorkingRemote(
+        this.remotes,
+        net_type
+      );
+      if (!remote || this.daemon.behindNoticeSent) return;
+      const [local, pub] = await Promise.all([
+        this.daemon.sendRPC("get_info", {}, { timeout: 10000 }),
+        this.daemon.checkRemote(
+          {
+            type: "remote",
+            remote_host: remote.host,
+            remote_port: remote.port
+          },
+          10000
+        )
+      ]);
+      if (local.error || pub.error || this.daemon.behindNoticeSent) return;
+      const height = local.result.height;
+      if (pub.height - height > 1000) {
+        this.daemon.behindNoticeSent = true;
+        this.send("local_daemon_behind", {
+          height,
+          target_height: pub.height
+        });
+      }
+    } catch (e) {
+      // Informational only
+    }
   }
 
   quit() {

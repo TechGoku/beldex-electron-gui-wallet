@@ -19,7 +19,9 @@
     "release": "quasar build -m electron --publish=always",
     "lint": "eslint --fix .",
     "format": "prettier --write \"**/*.+(js|jsx|json|yml|yaml|css|md|vue)\"",
-    "ready": "npm run lint && npm run format"
+    "ready": "npm run lint && npm run format",
+    "build:unpackaged": "quasar build -m electron --skip-pkg",
+    "test:lifecycle": "node test/lifecycle.test.cjs"
   },
   "dependencies": {
     "axios": "^1.18.0",

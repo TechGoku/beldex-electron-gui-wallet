@@ -412,7 +412,7 @@ export class Swap {
     }
 
     if (!exchange && params.id) {
-      exchange = this.swapTxnHistory.getTxnExchange(params.id, walletAddress);
+      exchange = this.swapTxnHistory.getTxnExchange(params.id);
     }
     if (!exchange) exchange = this.activeExchange;
 

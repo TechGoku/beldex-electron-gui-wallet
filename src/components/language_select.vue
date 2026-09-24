@@ -48,7 +48,7 @@ export default {
   },
   methods: {
     setLanguage(lang) {
-      this.$gateway.send("core", "set_language", { lang });
+      this.$gateway.setLanguage(lang);
       this.langData = lang;
       // this.$emit("select", lang);
     },

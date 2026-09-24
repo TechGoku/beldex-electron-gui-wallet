@@ -612,7 +612,7 @@ export default {
       }
 
       if (
-        this.wallet.refresh_start_height > this.daemon.info.target_height &&
+        this.walletKeys.refresh_start_height > this.daemon.info.target_height &&
         this.daemon.info.target_height !== 0
       ) {
         this.$q.notify({

@@ -669,10 +669,14 @@ export default {
       }
     },
     sendAmount(newvalue) {
-      this.clearAllintervals();
       this.minMaxAmoutValidator(newvalue);
-      this.getExchangeRate();
-      this.validateFixedIsEnabled();
+      // Only query the exchange once the user stops typing
+      clearTimeout(this.amountDebounce);
+      this.amountDebounce = setTimeout(() => {
+        this.clearAllintervals();
+        this.getExchangeRate();
+        this.validateFixedIsEnabled();
+      }, 400);
     },
     pairsMinMax(newVal) {
       this.checkExchangeFallback(newVal);
@@ -716,6 +720,10 @@ export default {
             item.name.toLowerCase() === "bdx" &&
             item.protocol.toLowerCase() === "bdx"
         );
+        if (!bdxCoin || !btcCoin) {
+          this.navigation("maintenance", 1);
+          return;
+        }
         if (bdxCoin.enabledTo) {
           fromCoin = btcCoin;
           toCoin = bdxCoin;
@@ -801,16 +809,9 @@ export default {
 
   computed: mapState({
     currencyList: state => {
-      let data = state.gateway.currencyList.result;
-      let pushedData = [];
-      if (data) {
-        Object.keys(data).length > 0 &&
-          data.map(item => {
-            item.value = item.ticker;
-            pushedData.push(item);
-          });
-      }
-      return pushedData;
+      const data = state.gateway.currencyList.result;
+      if (!Array.isArray(data)) return [];
+      return data.map(item => ({ ...item, value: item.ticker }));
     },
 
     exchange_amount: state => {
@@ -918,7 +919,28 @@ export default {
     });
   },
 
+  // The wallet layout keeps pages alive, so beforeDestroy doesn't run when
+  // navigating away. Pause all polling while hidden and resume on return.
+  deactivated() {
+    this.pausedInBackground = true;
+    clearTimeout(this.amountDebounce);
+    clearInterval(this.refreshFixedExchangeRate);
+    clearInterval(this.refreshFloatExchangeRate);
+    clearInterval(this.refreshMinMax);
+    clearInterval(this.refreshTxnStatus);
+    this.refreshTxnStatus = null;
+  },
+  activated() {
+    if (!this.pausedInBackground) return;
+    this.pausedInBackground = false;
+    if (this.routes === "mainPage" && this.receiveAmountType.value) {
+      this.restartAllIntervals();
+    } else if (this.routes === "settlement" || this.routes === "swapStatus") {
+      this.get_transaction_status();
+    }
+  },
   beforeDestroy() {
+    clearTimeout(this.amountDebounce);
     clearInterval(this.refreshFixedExchangeRate);
     clearInterval(this.refreshFloatExchangeRate);
     clearInterval(this.refreshTxnStatus);
@@ -926,9 +948,7 @@ export default {
   },
   methods: {
     navigation(page, step) {
-      this.$gateway.send("wallet", "set_stepperPosition", {
-        data: step
-      });
+      this.$gateway.setUiState("stepperPosition", step);
       this.routes = page;
     },
     navigateToHistory() {
@@ -1294,9 +1314,7 @@ export default {
         refundAdderss
       ) {
         this.routes = "makePayment";
-        this.$gateway.send("wallet", "set_stepperPosition", {
-          data: 2
-        });
+        this.$gateway.setUiState("stepperPosition", 2);
       } else {
         this.$q.notify({
           type: "negative",

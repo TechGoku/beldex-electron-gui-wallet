@@ -196,13 +196,9 @@ export default {
       //     address: address.address
       //   }
       // });
-      this.$gateway.send("wallet", "set_sender_address", {
-        data: address.address
-      });
+      this.$gateway.setUiState("sender_address", address.address);
 
-      this.$gateway.send("wallet", "set_router_path_rightpane", {
-        data: "send"
-      });
+      this.$gateway.setUiState("router_path_rightpane", "send");
     },
     displayAddressList() {
       this.isvisible = true;

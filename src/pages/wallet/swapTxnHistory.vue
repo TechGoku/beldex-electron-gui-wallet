@@ -333,6 +333,20 @@ export default {
       this.refreshTxnStatus = null;
     }
   },
+  // Kept alive with the swap page: stop polling while hidden
+  deactivated() {
+    if (this.refreshTxnStatus) {
+      clearInterval(this.refreshTxnStatus);
+      this.refreshTxnStatus = null;
+      this.resumeStatusPolling = true;
+    }
+  },
+  activated() {
+    if (this.resumeStatusPolling && this.txnDetails) {
+      this.resumeStatusPolling = false;
+      this.setTxnDetails(this.txnDetails);
+    }
+  },
   computed: {
     ...mapState({
       txnHistory: state => {

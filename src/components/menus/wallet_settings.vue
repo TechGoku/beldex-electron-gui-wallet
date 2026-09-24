@@ -444,7 +444,11 @@
 </template>
 
 <script>
-import { clipboard } from "src/shims/electron-renderer";
+import {
+  clipboard,
+  getPathForFile,
+  selectDirectory
+} from "src/shims/electron-renderer";
 import { mapState } from "vuex";
 import WalletPassword from "src/mixins/wallet_password";
 import OxenField from "components/oxen_field";
@@ -668,17 +672,18 @@ export default {
     //     this.$gateway.send("wallet", "rescan_spent");
     //   }
     // },
-    selectKeyImageExportPath() {
-      this.$refs.keyImageExportSelect.click();
+    async selectKeyImageExportPath() {
+      const dir = await selectDirectory(this.modals.key_image.export_path);
+      if (dir) this.modals.key_image.export_path = dir;
     },
     setKeyImageExportPath(file) {
-      this.modals.key_image.export_path = file.target.files[0].path;
+      this.modals.key_image.export_path = getPathForFile(file.target.files[0]);
     },
     selectKeyImageImportPath() {
       this.$refs.keyImageImportSelect.click();
     },
     setKeyImageImportPath(file) {
-      this.modals.key_image.import_path = file.target.files[0].path;
+      this.modals.key_image.import_path = getPathForFile(file.target.files[0]);
     },
     async doKeyImages() {
       this.hideModal("key_image");

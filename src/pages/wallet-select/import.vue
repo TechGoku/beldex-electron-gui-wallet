@@ -98,6 +98,7 @@
 </template>
 
 <script>
+import { getPathForFile } from "src/shims/electron-renderer";
 import { required } from "vuelidate/lib/validators";
 import { mapState } from "vuex";
 import OxenField from "components/oxen_field";
@@ -160,7 +161,7 @@ export default {
       this.$refs.fileInput.click();
     },
     setWalletPath(file) {
-      this.wallet.path = file.target.files[0].path;
+      this.wallet.path = getPathForFile(file.target.files[0]);
     },
     import_wallet() {
       this.$v.wallet.$touch();

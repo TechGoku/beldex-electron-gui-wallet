@@ -488,8 +488,8 @@ export default {
       let destinations = [];
       let address_book = state.gateway.wallet.address_list.address_book;
       for (i = 0; i < this.tx.destinations.length; i++) {
-        let destination = this.tx.destinations[i];
-        destination.name = "";
+        // copy: tx entries are store data and must not be mutated here
+        let destination = { ...this.tx.destinations[i], name: "" };
         for (j = 0; j < address_book.length; j++) {
           if (destination.address == address_book[j].address) {
             const { name, description } = address_book[j];

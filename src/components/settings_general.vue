@@ -502,6 +502,7 @@
 </template>
 
 <script>
+import { getPathForFile, selectDirectory } from "src/shims/electron-renderer";
 import { mapState } from "vuex";
 import OxenField from "components/oxen_field";
 export default {
@@ -568,18 +569,19 @@ export default {
       this.$gateway.send("core", "save_config", this.pending_config);
       this.isVisible = false;
     },
-    selectPath(type) {
-      const fileInput = type === "data" ? "fileInputData" : "fileInputWallet";
-      this.$refs[fileInput].click();
+    async selectPath(type) {
+      const key = type === "data" ? "data_dir" : "wallet_data_dir";
+      const dir = await selectDirectory(this.config.app[key]);
+      if (dir) this.config.app[key] = dir;
     },
     setDataPath(file) {
       if (file.target.files && file.target.files.length > 0) {
-        this.config.app.data_dir = file.target.files[0].path;
+        this.config.app.data_dir = getPathForFile(file.target.files[0]);
       }
     },
     setWalletDataPath(file) {
       if (file.target.files && file.target.files.length > 0) {
-        this.config.app.wallet_data_dir = file.target.files[0].path;
+        this.config.app.wallet_data_dir = getPathForFile(file.target.files[0]);
       }
     },
     setPreset(option) {

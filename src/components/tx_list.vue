@@ -56,13 +56,7 @@
             </q-item-label>
             <q-item-section class="meta">
               <q-item-label class="ft-small">
-                {{
-                  `${
-                    monthNames[new Date(tx.timestamp * 1000).getMonth()]
-                  } ${new Date(tx.timestamp * 1000).getDate()},${new Date(
-                    tx.timestamp * 1000
-                  ).getFullYear()}`
-                }}
+                {{ formatDate(tx.timestamp) }}
                 <!-- <timeago
                   :datetime="tx.timestamp * 1000"
                   :auto-update="60"
@@ -216,25 +210,14 @@ export default {
   computed: mapState({
     theme: state => state.gateway.app.config.appearance.theme,
     current_height: state => state.gateway.daemon.info.height,
-    wallet_height: state => state.gateway.wallet.info.height,
     tx_list: state => state.gateway.wallet.transactions.tx_list,
     address_book: state => state.gateway.wallet.address_list.address_book
   }),
   watch: {
-    wallet_height: {
-      handler(val, old) {
-        if (val == old) return;
-        this.filterTxList();
-        this.pageTxList();
-      }
-    },
+    // The backend only pushes a new list when something in it changed, so
+    // there is no need to refilter on every block height tick.
     tx_list: {
-      handler(val, old) {
-        // Check if anything changed in the tx list
-        if (val.length == old.length) {
-          const changed = val.filter((v, i) => v.note !== old[i].note);
-          if (changed.length === 0) return;
-        }
+      handler() {
         this.filterTxList();
         this.pageTxList();
       }
@@ -386,6 +369,12 @@ export default {
     },
     details(tx) {
       this.$emit("submitTxDetails", tx);
+    },
+    formatDate(timestamp) {
+      const date = new Date(timestamp * 1000);
+      return `${
+        this.monthNames[date.getMonth()]
+      } ${date.getDate()},${date.getFullYear()}`;
     },
     formatHeight(tx) {
       let height = tx.height;

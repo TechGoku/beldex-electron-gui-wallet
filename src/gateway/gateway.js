@@ -6,6 +6,8 @@ import { appIpc } from "src/shims/electron-renderer";
 export class Gateway extends EventEmitter {
   constructor(app, router) {
     super();
+    // Several forms can validate addresses at the same time
+    this.setMaxListeners(50);
     this.app = app;
     this.router = router;
     this.token = null;
@@ -158,7 +160,22 @@ export class Gateway extends EventEmitter {
       });
   }
 
+  // UI-only state (right pane, pre-filled send address, swap stepper) lives
+  // in the store; it used to round-trip through the backend.
+  setUiState(key, value) {
+    const mutations = {
+      router_path_rightpane: "gateway/set_router_path_rightpane",
+      sender_address: "gateway/set_sender_address",
+      stepperPosition: "gateway/set_stepperPosition"
+    };
+    this.app.store.commit(mutations[key], value);
+  }
+
   send(module, method, data = {}) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      console.warn(`Gateway not connected, dropping ${module}/${method}`);
+      return;
+    }
     let message = {
       module,
       method,
@@ -178,9 +195,15 @@ export class Gateway extends EventEmitter {
   receive(message) {
     // should wrap this in a try catch, and if fail redirect to error screen
     // shouldn't happen outside of dev environment
-    let decrypted_data = JSON.parse(
-      this.secureCrypto.decryptString(message, this.token)
-    );
+    let decrypted_data;
+    try {
+      decrypted_data = JSON.parse(
+        this.secureCrypto.decryptString(message, this.token)
+      );
+    } catch (error) {
+      console.error("Dropping undecryptable websocket frame");
+      return;
+    }
 
     if (
       typeof decrypted_data !== "object" ||
@@ -411,6 +434,36 @@ export class Gateway extends EventEmitter {
       case "set_fixedExchangeRate":
         this.app.store.commit(
           "gateway/set_fixedExchangeRate",
+          decrypted_data.data
+        );
+        break;
+
+      case "local_daemon_behind": {
+        const { height, target_height } = decrypted_data.data;
+        Dialog.create({
+          title: "Local node is still syncing",
+          message:
+            `Your local node is at block ${height} of ${target_height}. ` +
+            "Until it catches up, your balance and transactions can be out of date. " +
+            'Switch to "Local + Remote" so the wallet uses a public node while your ' +
+            "local node keeps syncing in the background?",
+          ok: { label: "Use Local + Remote", color: "primary" },
+          cancel: { label: "Keep syncing locally", color: "accent" },
+          persistent: true
+        }).onOk(() => {
+          const config = JSON.parse(
+            JSON.stringify(this.app.store.state.gateway.app.config)
+          );
+          config.daemons[config.app.net_type].type = "local_remote";
+          // The backend saves it and asks to restart to apply it
+          this.send("core", "save_config", config);
+        });
+        break;
+      }
+
+      case "set_activeExchange":
+        this.app.store.commit(
+          "gateway/set_activeExchange",
           decrypted_data.data
         );
         break;

@@ -126,7 +126,11 @@ export default {
             signed_key_images[j].key_image
           ) {
             degisterList.push(
-              Object.assign(signed_key_images[j], master_nodes_deregister[i])
+              Object.assign(
+                {},
+                signed_key_images[j],
+                master_nodes_deregister[i]
+              )
             );
           }
         }

@@ -367,13 +367,9 @@ export default {
     sendToAddress() {
       // this.close();
 
-      this.$gateway.send("wallet", "set_sender_address", {
-        data: this.entry.address
-      });
+      this.$gateway.setUiState("sender_address", this.entry.address);
 
-      this.$gateway.send("wallet", "set_router_path_rightpane", {
-        data: "send"
-      });
+      this.$gateway.setUiState("router_path_rightpane", "send");
 
       // set_router_path_rightpane
       // this.$router.replace({

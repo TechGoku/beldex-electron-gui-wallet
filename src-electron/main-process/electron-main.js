@@ -33,6 +33,7 @@ let showConfirmClose = true;
 let forceQuit = false;
 let installUpdate = false;
 let startingToken = null;
+let backendConfig = null;
 
 const title = `${productName} v${version}`;
 
@@ -144,8 +145,6 @@ function createWindow() {
           e.preventDefault();
           mainWindow.show();
           mainWindow.webContents.send("confirmClose");
-        } else {
-          e.defaultPrevented = false;
         }
       } else {
         e.preventDefault();
@@ -155,12 +154,26 @@ function createWindow() {
       if (showConfirmClose) {
         e.preventDefault();
         mainWindow.webContents.send("confirmClose");
-      } else {
-        e.defaultPrevented = false;
       }
     }
   });
 
+  mainWindow.on("closed", () => {
+    mainWindow = null;
+  });
+
+  ipcMain.removeHandler("select-directory");
+  ipcMain.handle("select-directory", async (_event, defaultPath) => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ["openDirectory", "createDirectory"],
+      defaultPath: typeof defaultPath === "string" ? defaultPath : undefined
+    });
+    return result.canceled || !result.filePaths.length
+      ? ""
+      : result.filePaths[0];
+  });
+
+  ipcMain.removeAllListeners("confirmClose");
   ipcMain.on("confirmClose", (e, restart) => {
     showConfirmClose = false;
 
@@ -177,6 +190,13 @@ function createWindow() {
   mainWindow.webContents.on("did-finish-load", () => {
     // Set the title
     mainWindow.setTitle(title);
+
+    // A renderer reload (or crash recovery) must reconnect to the running
+    // backend; starting a second one would find our own port busy and quit.
+    if (backend && backendConfig) {
+      mainWindow.webContents.send("initialize", backendConfig);
+      return;
+    }
 
     require("crypto").randomBytes(64, (err, buffer) => {
       // if err, then we may have to use insecure token generation perhaps
@@ -195,22 +215,21 @@ function createWindow() {
         if (status === "closed") {
           backend = new Backend(mainWindow);
           backend.init(config);
+          backendConfig = config;
           startingToken = config.token;
           mainWindow.webContents.send("initialize", config);
         } else {
-          dialog.showMessageBox(
-            mainWindow,
-            {
+          dialog
+            .showMessageBox(mainWindow, {
               title: "Startup error",
               message: `Beldex Wallet is already open, or port ${config.port} is in use`,
               type: "error",
               buttons: ["ok"]
-            },
-            () => {
+            })
+            .finally(() => {
               showConfirmClose = false;
               app.quit();
-            }
-          );
+            });
         }
       });
     });
@@ -228,8 +247,14 @@ function createWindow() {
   mainWindowState.manage(mainWindow);
 }
 
+function sendToWindow(channel, data) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, data);
+  }
+}
+
 powerMonitor.on("suspend", () => {
-  mainWindow.webContents.send("appSuspend");
+  sendToWindow("appSuspend");
 });
 
 powerMonitor.on("resume", () => {
@@ -237,7 +262,7 @@ powerMonitor.on("resume", () => {
     port: 12313,
     token: startingToken
   };
-  mainWindow.webContents.send("appResumed", config);
+  sendToWindow("appResumed", config);
 });
 
 app.on("ready", () => {
@@ -314,7 +339,7 @@ app.on("before-quit", () => {
   } else {
     if (backend) {
       backend.quit().then(() => {
-        mainWindow.close();
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
       });
     }
   }
