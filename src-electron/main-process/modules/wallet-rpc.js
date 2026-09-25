@@ -7,10 +7,24 @@ const fs = require("fs-extra");
 const path = require("upath");
 const crypto = require("crypto");
 const portscanner = require("portscanner");
+import { DaemonProxy } from "./daemon-proxy";
 
 const PASSWORD_HASH_PBKDF2_ITERATIONS = 600000;
 const PASSWORD_HASH_KEY_LENGTH = 64;
 const PASSWORD_HASH_DIGEST = "sha512";
+
+// Sync loop timing (see syncLoop)
+const SYNC_CHUNK_MS = 30000;
+const SAVE_EVERY_MS = 60000;
+const IDLE_POLL_MS = 10000;
+const WALLET_SWITCH_METHODS = new Set([
+  "open_wallet",
+  "create_wallet",
+  "close_wallet",
+  "restore_deterministic_wallet",
+  "restore_view_wallet",
+  "generate_from_keys"
+]);
 
 export class WalletRPC {
   constructor(backend) {
@@ -44,35 +58,24 @@ export class WalletRPC {
     // A mapping of name => type
     this.purchasedNames = {};
 
-    this.height_regexes = [
-      {
-        string: /Processed block: <([a-f0-9]+)>, height (\d+)/,
-        height: match => match[2]
-      },
-      {
-        string: /Skipped block by height: (\d+)/,
-        height: match => match[1]
-      },
-      {
-        string: /Skipped block by timestamp, height: (\d+)/,
-        height: match => match[1]
-      },
-      {
-        string: /Blockchain sync progress: <([a-f0-9]+)>, height (\d+)/,
-        height: match => match[2]
-      }
-    ];
-
     this.agent = new http.Agent({ keepAlive: true, maxSockets: 10 });
     this.queue = new queue(1, Infinity);
 
     // Incremental transaction cache (see getTransactions)
     this.resetTxCache();
 
-    // Sync tracking: wallet-rpc prints block progress while refreshing
-    this.last_sync_line_time = 0;
     this.heartbeat_in_flight = false;
     this.history_refresh_pending = false;
+
+    // Sync loop state (see syncLoop)
+    this.proxy = null;
+    this.syncGeneration = 0;
+    this.syncLoopDone = null;
+    this.syncWake = null;
+    this.refreshing = false;
+    this.caughtUp = false;
+    this.rescanFrom = null;
+    this.last_progress_send_time = 0;
   }
 
   // this function will take an options object for testnet, data-dir, etc
@@ -80,189 +83,184 @@ export class WalletRPC {
     const { net_type } = options.app;
     const daemon = options.daemons[net_type];
     return new Promise((resolve, reject) => {
-      let daemon_address = `${daemon.rpc_bind_ip}:${daemon.rpc_bind_port}`;
-      if (daemon.type == "remote") {
-        daemon_address = `${daemon.remote_host}:${daemon.remote_port}`;
-      }
+      const upstream =
+        daemon.type == "remote"
+          ? [daemon.remote_host, daemon.remote_port]
+          : [daemon.rpc_bind_ip, daemon.rpc_bind_port];
+      this.proxy = new DaemonProxy({
+        cacheDir: path.join(
+          options.app.data_dir,
+          "cache",
+          "block-hashes",
+          net_type
+        )
+      });
+      this.proxy.on("progress", progress => this.onScanProgress(progress));
 
-      crypto.randomBytes(64 + 64 + 32, (err, buffer) => {
-        if (err) throw err;
+      this.proxy.start(...upstream).then(proxyPort => {
+        // wallet-rpc reaches the node through the proxy (see syncLoop)
+        const daemon_address = `127.0.0.1:${proxyPort}`;
 
-        let auth = buffer.toString("hex");
+        crypto.randomBytes(64 + 64 + 32, (err, buffer) => {
+          if (err) throw err;
 
-        this.auth = [
-          auth.substr(0, 64), // rpc username
-          auth.substr(64, 64), // rpc password
-          auth.substr(128, 32) // password salt
-        ];
+          let auth = buffer.toString("hex");
 
-        const args = [
-          "--rpc-login",
-          this.auth[0] + ":" + this.auth[1],
-          "--rpc-bind-port",
-          options.wallet.rpc_bind_port,
-          "--daemon-address",
-          daemon_address,
-          "--rpc-bind-ip",
-          "127.0.0.1",
-          "--log-level",
-          options.wallet.log_level,
-          "--trusted-daemon"
-        ];
+          this.auth = [
+            auth.substr(0, 64), // rpc username
+            auth.substr(64, 64), // rpc password
+            auth.substr(128, 32) // password salt
+          ];
 
-        const { net_type, wallet_data_dir, data_dir } = options.app;
-        this.net_type = net_type;
-        this.data_dir = data_dir;
-        this.wallet_data_dir = wallet_data_dir;
+          const args = [
+            "--rpc-login",
+            this.auth[0] + ":" + this.auth[1],
+            "--rpc-bind-port",
+            options.wallet.rpc_bind_port,
+            "--daemon-address",
+            daemon_address,
+            "--rpc-bind-ip",
+            "127.0.0.1",
+            "--log-level",
+            options.wallet.log_level,
+            "--trusted-daemon"
+          ];
 
-        this.dirs = {
-          mainnet: this.wallet_data_dir,
-          stagenet: path.join(this.wallet_data_dir, "stagenet"),
-          testnet: path.join(this.wallet_data_dir, "testnet")
-        };
+          const { net_type, wallet_data_dir, data_dir } = options.app;
+          this.net_type = net_type;
+          this.data_dir = data_dir;
+          this.wallet_data_dir = wallet_data_dir;
 
-        this.wallet_dir = path.join(this.dirs[net_type], "wallets");
-        args.push("--wallet-dir", this.wallet_dir);
+          this.dirs = {
+            mainnet: this.wallet_data_dir,
+            stagenet: path.join(this.wallet_data_dir, "stagenet"),
+            testnet: path.join(this.wallet_data_dir, "testnet")
+          };
 
-        const log_file = path.join(
-          this.dirs[net_type],
-          "logs",
-          "wallet-rpc.log"
-        );
-        args.push("--log-file", log_file);
+          this.wallet_dir = path.join(this.dirs[net_type], "wallets");
+          args.push("--wallet-dir", this.wallet_dir);
 
-        if (net_type === "testnet") {
-          args.push("--testnet");
-        } else if (net_type === "stagenet") {
-          args.push("--stagenet");
-        }
-
-        if (fs.existsSync(log_file)) {
-          fs.truncateSync(log_file, 0);
-        }
-
-        if (!fs.existsSync(this.wallet_dir)) {
-          fs.mkdirpSync(this.wallet_dir);
-        }
-
-        // save this info for later RPC calls
-        this.protocol = "http://";
-        this.hostname = "127.0.0.1";
-        this.port = options.wallet.rpc_bind_port;
-
-        const rpcExecutable =
-          process.platform === "win32"
-            ? "beldex-wallet-rpc.exe"
-            : "beldex-wallet-rpc";
-        // eslint-disable-next-line no-undef
-        const rpcPath = path.join(__ryo_bin, rpcExecutable);
-
-        // Check if the rpc exists
-        if (!fs.existsSync(rpcPath)) {
-          reject(
-            new Error(
-              "Failed to find Beldex Wallet RPC. Please make sure your anti-virus has not removed it."
-            )
+          const log_file = path.join(
+            this.dirs[net_type],
+            "logs",
+            "wallet-rpc.log"
           );
-          return;
-        }
+          args.push("--log-file", log_file);
 
-        portscanner
-          .checkPortStatus(this.port, this.hostname)
-          .catch(() => "closed")
-          .then(async status => {
-            if (status === "closed") return status;
-            // Usually a wallet-rpc left over from a previous session. Its
-            // credentials are unknown, so run ours on another free port.
-            const freePort = await portscanner
-              .findAPortNotInUse(this.port + 1, this.port + 200, this.hostname)
-              .catch(() => null);
-            if (!freePort) return status;
-            process.stderr.write(
-              `Wallet: port ${this.port} is in use, using ${freePort}\n`
+          if (net_type === "testnet") {
+            args.push("--testnet");
+          } else if (net_type === "stagenet") {
+            args.push("--stagenet");
+          }
+
+          if (fs.existsSync(log_file)) {
+            fs.truncateSync(log_file, 0);
+          }
+
+          if (!fs.existsSync(this.wallet_dir)) {
+            fs.mkdirpSync(this.wallet_dir);
+          }
+
+          // save this info for later RPC calls
+          this.protocol = "http://";
+          this.hostname = "127.0.0.1";
+          this.port = options.wallet.rpc_bind_port;
+
+          const rpcExecutable =
+            process.platform === "win32"
+              ? "beldex-wallet-rpc.exe"
+              : "beldex-wallet-rpc";
+          // eslint-disable-next-line no-undef
+          const rpcPath = path.join(__ryo_bin, rpcExecutable);
+
+          // Check if the rpc exists
+          if (!fs.existsSync(rpcPath)) {
+            reject(
+              new Error(
+                "Failed to find Beldex Wallet RPC. Please make sure your anti-virus has not removed it."
+              )
             );
-            this.port = freePort;
-            args[args.indexOf("--rpc-bind-port") + 1] = freePort;
-            return "closed";
-          })
-          .then(status => {
-            if (status === "closed") {
-              const options =
-                process.platform === "win32" ? {} : { detached: true };
-              this.walletRPCProcess = child_process.spawn(
-                rpcPath,
-                args,
-                options
+            return;
+          }
+
+          portscanner
+            .checkPortStatus(this.port, this.hostname)
+            .catch(() => "closed")
+            .then(async status => {
+              if (status === "closed") return status;
+              // Usually a wallet-rpc left over from a previous session. Its
+              // credentials are unknown, so run ours on another free port.
+              const freePort = await portscanner
+                .findAPortNotInUse(
+                  this.port + 1,
+                  this.port + 200,
+                  this.hostname
+                )
+                .catch(() => null);
+              if (!freePort) return status;
+              process.stderr.write(
+                `Wallet: port ${this.port} is in use, using ${freePort}\n`
               );
+              this.port = freePort;
+              args[args.indexOf("--rpc-bind-port") + 1] = freePort;
+              return "closed";
+            })
+            .then(status => {
+              if (status === "closed") {
+                const options =
+                  process.platform === "win32" ? {} : { detached: true };
+                this.walletRPCProcess = child_process.spawn(
+                  rpcPath,
+                  args,
+                  options
+                );
 
-              this.walletRPCProcess.stdout.on("data", data => {
-                process.stdout.write(`Wallet: ${data}`);
-
-                let lines = data.toString().split("\n");
-                let match,
-                  height = null;
-                for (const line of lines) {
-                  for (const regex of this.height_regexes) {
-                    match = line.match(regex.string);
-                    if (match) {
-                      height = regex.height(match);
-                      break;
-                    }
-                  }
-                }
-                if (height) {
-                  this.last_sync_line_time = Date.now();
-                }
-                this.updateSyncingFlag();
-
-                if (height && Date.now() - this.last_height_send_time > 1000) {
-                  this.last_height_send_time = Date.now();
-                  this.sendGateway("set_wallet_data", {
-                    info: {
-                      height
-                    }
-                  });
-                }
-              });
-              this.walletRPCProcess.on("error", err =>
-                process.stderr.write(`Wallet: ${err}`)
-              );
-              this.walletRPCProcess.on("close", code => {
-                process.stderr.write(`Wallet: exited with code ${code} \n`);
-                this.walletRPCProcess = null;
-                this.agent.destroy();
-                if (code === null) {
-                  reject(new Error("Failed to start wallet RPC"));
-                }
-              });
-
-              // To let caller know when the wallet is ready
-              let intrvl = setInterval(() => {
-                this.sendRPC("get_languages").then(data => {
-                  if (!data.hasOwnProperty("error")) {
-                    clearInterval(intrvl);
-                    resolve();
-                  } else {
-                    if (
-                      this.walletRPCProcess &&
-                      data.error.cause &&
-                      data.error.cause.code === "ECONNREFUSED"
-                    ) {
-                      // Ignore
-                    } else {
-                      clearInterval(intrvl);
-                      if (this.walletRPCProcess) this.walletRPCProcess.kill();
-                      this.walletRPCProcess = null;
-                      reject(new Error("Could not connect to wallet RPC"));
-                    }
+                this.walletRPCProcess.stdout.on("data", data => {
+                  process.stdout.write(`Wallet: ${data}`);
+                });
+                this.walletRPCProcess.on("error", err =>
+                  process.stderr.write(`Wallet: ${err}`)
+                );
+                this.walletRPCProcess.on("close", code => {
+                  process.stderr.write(`Wallet: exited with code ${code} \n`);
+                  this.walletRPCProcess = null;
+                  this.agent.destroy();
+                  if (code === null) {
+                    reject(new Error("Failed to start wallet RPC"));
                   }
                 });
-              }, 1000);
-            } else {
-              reject(new Error(`Wallet RPC port ${this.port} is in use`));
-            }
-          });
-      });
+
+                // To let caller know when the wallet is ready
+                let intrvl = setInterval(() => {
+                  this.sendRPC("get_languages").then(data => {
+                    if (!data.hasOwnProperty("error")) {
+                      clearInterval(intrvl);
+                      // The app drives refreshes itself (see syncLoop)
+                      this.sendRPC("auto_refresh", { enable: false }).then(() =>
+                        resolve()
+                      );
+                    } else {
+                      if (
+                        this.walletRPCProcess &&
+                        data.error.cause &&
+                        data.error.cause.code === "ECONNREFUSED"
+                      ) {
+                        // Ignore
+                      } else {
+                        clearInterval(intrvl);
+                        if (this.walletRPCProcess) this.walletRPCProcess.kill();
+                        this.walletRPCProcess = null;
+                        reject(new Error("Could not connect to wallet RPC"));
+                      }
+                    }
+                  });
+                }, 1000);
+              } else {
+                reject(new Error(`Wallet RPC port ${this.port} is in use`));
+              }
+            });
+        });
+      }, reject);
     });
   }
 
@@ -468,7 +466,7 @@ export class WalletRPC {
         break;
 
       case "rescan_blockchain":
-        this.rescanBlockchain();
+        this.rescanBlockchain(params || {});
         break;
       case "rescan_spent":
         this.rescanSpent();
@@ -1056,35 +1054,158 @@ export class WalletRPC {
 
   startHeartbeat() {
     clearInterval(this.heartbeat);
-    this.heartbeat = setInterval(() => {
-      this.heartbeatAction();
-    }, 8000);
-    this.heartbeatAction(true);
-    this.startSync();
+    this.history_refresh_pending = true;
     this.startBnsHeartBeat();
+    this.startSyncLoop();
   }
 
-  // wallet-rpc waits 20 s between its automatic refreshes, so a wallet that
-  // was just opened/created/restored could sit idle for up to 20 s before
-  // scanning starts, and new blocks could show up to 20 s late. Start scanning
-  // right away (like the CLI wallet does) and poll the chain more often.
-  startSync() {
-    this.sendRPC("auto_refresh", { enable: true, period: 10 });
-    this.sendRPC("refresh").then(data => {
-      if (data.hasOwnProperty("error")) return;
-      this.last_sync_line_time = 0;
-      this.updateSyncingFlag();
-      // Report the new height immediately instead of waiting for the heartbeat
-      this.sendRPC("getheight", {}, 5000).then(heightData => {
-        if (!heightData.result) return;
-        const height = heightData.result.height;
-        if (height !== this.wallet_state.height) {
-          this.wallet_state.height = height;
-          this.sendGateway("set_wallet_data", { info: { height } });
-        }
-      });
+  // Sync design: wallet-rpc talks to the node through DaemonProxy and the app
+  // drives every refresh itself (wallet-rpc's auto refresh is off). A scan
+  // runs in chunks of SYNC_CHUNK_MS: the proxy then ends it, the app reads
+  // height and balance, saves every SAVE_EVERY_MS, and starts the next chunk,
+  // which carries on from the same block. Closing, switching or quitting ends
+  // a scan at once and saves it, so progress is never lost. A user action
+  // while a chunk runs ends that chunk early (see sendRPC).
+  startSyncLoop() {
+    const generation = ++this.syncGeneration;
+    if (!this.rescanFrom) this.rescanFrom = this.readRescanFrom();
+    this.syncLoopDone = this.syncLoop(generation).catch(e =>
+      console.debug("Wallet sync loop failed: ", e)
+    );
+  }
+
+  async syncLoop(generation) {
+    const current = () =>
+      generation === this.syncGeneration && this.wallet_state.open;
+    // History from the wallet cache before scanning starts
+    await this.heartbeatAction(true);
+    let lastSave = Date.now();
+    let savedHeight = this.wallet_state.height;
+    let failures = 0;
+    while (current()) {
+      let chunkEnded = false;
+      const chunk = setTimeout(() => {
+        chunkEnded = true;
+        this.proxy.pause();
+      }, SYNC_CHUNK_MS);
+      this.refreshing = true;
+      const data = await this.sendRPC(
+        "refresh",
+        this.rescanFrom ? { start_height: this.rescanFrom } : {}
+      );
+      this.refreshing = false;
+      clearTimeout(chunk);
+      const interrupted = chunkEnded || this.proxy.paused;
+      this.proxy.resume();
+      if (generation !== this.syncGeneration) break;
+
+      await this.heartbeatAction();
+      if (!current()) break;
+
+      const error = data.hasOwnProperty("error");
+      const caughtUp = !error && !interrupted;
+      if (caughtUp !== this.caughtUp) {
+        this.caughtUp = caughtUp;
+        this.isRPCSyncing = !caughtUp;
+        this.sendGateway("set_wallet_data", { isRPCSyncing: !caughtUp });
+        if (caughtUp) this.updateLocalBNSRecords();
+      }
+      // "Rescan from height" passes start_height until the wallet reaches it
+      // (wallet2 skips blocks below the wallet's own restore height anyway)
+      if (this.rescanFrom && this.wallet_state.height >= this.rescanFrom) {
+        this.setRescanFrom(null);
+      }
+      // Save regularly while scanning (crash / power loss) and once caught up
+      if (
+        this.wallet_state.height > savedHeight &&
+        (caughtUp || Date.now() - lastSave >= SAVE_EVERY_MS)
+      ) {
+        await this.sendRPC("store");
+        lastSave = Date.now();
+        savedHeight = this.wallet_state.height;
+      }
+      if (caughtUp) {
+        failures = 0;
+        await this.idle(IDLE_POLL_MS, generation);
+      } else if (error && !interrupted) {
+        // Node unreachable or busy: back off, but keep trying
+        failures++;
+        await this.idle(Math.min(30000, 2000 * failures), generation);
+      }
+    }
+  }
+
+  // Ends a running scan within a second and waits for the sync loop to exit.
+  // Everything scanned so far stays in the wallet (the caller saves it).
+  async stopSync() {
+    this.syncGeneration++;
+    this.wakeSync();
+    const done = this.syncLoopDone;
+    this.syncLoopDone = null;
+    if (!done) return;
+    if (this.proxy) this.proxy.pause();
+    await Promise.race([done, new Promise(r => setTimeout(r, 20000))]);
+    if (this.proxy) this.proxy.resume();
+  }
+
+  // An unfinished "rescan from height" is kept next to the wallet, so it
+  // carries on after a restart (in either app: they share the wallet folder)
+  rescanFromFile() {
+    return path.join(this.wallet_dir, `${this.wallet_state.name}.rescan-from`);
+  }
+
+  readRescanFrom() {
+    try {
+      return (
+        Number.parseInt(fs.readFileSync(this.rescanFromFile(), "utf8")) || null
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  setRescanFrom(height) {
+    this.rescanFrom = height;
+    try {
+      if (height) fs.writeFileSync(this.rescanFromFile(), String(height));
+      else fs.removeSync(this.rescanFromFile());
+    } catch (e) {
+      // Only matters if the app is closed mid-rescan
+    }
+  }
+
+  // Starts the next refresh now instead of after the idle wait
+  wakeSync() {
+    const wake = this.syncWake;
+    this.syncWake = null;
+    if (wake) wake();
+  }
+
+  idle(ms, generation) {
+    if (generation !== this.syncGeneration) return Promise.resolve();
+    return new Promise(resolve => {
+      const wake = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        if (this.syncWake === wake) this.syncWake = null;
+        resolve();
+      }, ms);
+      this.syncWake = wake;
     });
   }
+
+  // Live scan progress from the block responses the proxy sees
+  onScanProgress({ height }) {
+    if (!this.wallet_state.open || height <= this.wallet_state.height) return;
+    this.wallet_state.height = height;
+    if (Date.now() - this.last_progress_send_time > 500) {
+      this.last_progress_send_time = Date.now();
+      this.sendGateway("set_wallet_data", { info: { height } });
+    }
+  }
+
   startBnsHeartBeat() {
     clearInterval(this.bnsHeartbeat);
     this.bnsHeartbeat = setInterval(() => {
@@ -1096,22 +1217,9 @@ export class WalletRPC {
     this.updateLocalBNSRecords();
   }
 
-  updateSyncingFlag() {
-    // At log level 0 wallet-rpc prints progress every 2000 blocks
-    const syncing = Date.now() - this.last_sync_line_time < 45000;
-    if (syncing !== this.isRPCSyncing) {
-      this.isRPCSyncing = syncing;
-      this.sendGateway("set_wallet_data", { isRPCSyncing: syncing });
-    }
-  }
-
-  // True while the wallet is still scanning blocks it hasn't seen yet
+  // True until the wallet has caught up with the node
   isWalletSyncing() {
-    if (this.isRPCSyncing) return true;
-    const daemon = this.backend.daemon;
-    const daemonHeight = daemon && daemon.info && daemon.info.height;
-    if (!daemonHeight || !this.wallet_state.height) return false;
-    return this.wallet_state.height < daemonHeight - 2;
+    return this.wallet_state.open && !this.caughtUp;
   }
 
   // The heartbeat only polls cheap calls. Transaction history, subaddresses
@@ -1119,7 +1227,7 @@ export class WalletRPC {
   // the wallet is syncing that work is deferred (at most once a minute) so
   // wallet-rpc can spend its time scanning blocks, like the CLI wallet does.
   heartbeatAction(extended = false) {
-    if (this.heartbeat_in_flight && !extended) return;
+    if (this.heartbeat_in_flight && !extended) return Promise.resolve();
     this.heartbeat_in_flight = true;
 
     const calls = [
@@ -1130,7 +1238,7 @@ export class WalletRPC {
       calls.push(this.sendRPC("get_address", { account_index: 0 }, 5000));
     }
 
-    Promise.all(calls)
+    return Promise.all(calls)
       .then(data => {
         let didError = false;
         const info = {};
@@ -1165,8 +1273,6 @@ export class WalletRPC {
             }
           }
         }
-
-        this.updateSyncingFlag();
 
         if (extended) {
           if (didError) {
@@ -1252,7 +1358,8 @@ export class WalletRPC {
       const addressData = await this.sendRPC(
         "get_address",
         { account_index: 0 },
-        5000
+        0,
+        { background: true }
       );
       if (
         addressData.hasOwnProperty("error") ||
@@ -1299,7 +1406,7 @@ export class WalletRPC {
       this.wallet_state.bnsRecords = newRecords;
       // fetch the known (cached) records from the wallet and add the data
       // to the records being set in state
-      let known_names = await this.bnsKnownNames();
+      let known_names = await this.bnsKnownNames({ background: true });
       for (let r of newRecords) {
         for (let k of known_names) {
           if (k.hashed === r.name_hash) {
@@ -1323,13 +1430,13 @@ export class WalletRPC {
   /*
   Get the BNS records cached in this wallet. 
   */
-  async bnsKnownNames() {
+  async bnsKnownNames(options = {}) {
     try {
       let params = {
         decrypt: true,
         include_expired: false
       };
-      let data = await this.sendRPC("bns_known_names", params);
+      let data = await this.sendRPC("bns_known_names", params, 0, options);
       if (data.result && data.result.known_names) {
         return data.result.known_names;
       } else {
@@ -2304,14 +2411,40 @@ export class WalletRPC {
     });
   }
 
-  rescanBlockchain() {
-    clearInterval(this.heartbeat);
+  // Rescans from the restore height, or from params.from_height /
+  // params.from_timestamp (ms): blocks below it are skipped, which is much
+  // faster when you know roughly when the funds arrived. Runs in the sync
+  // loop, so it shows progress and survives closing the wallet.
+  async rescanBlockchain(params = {}) {
+    let fromHeight = Number.parseInt(params.from_height) || null;
+    if (!fromHeight && params.from_timestamp) {
+      const day = 86400000;
+      const timestamp =
+        params.from_timestamp - (params.from_timestamp % day) - day;
+      const height = await this.backend.daemon.timestampToHeight(timestamp);
+      if (height === false) {
+        this.sendGateway("show_notification", {
+          type: "negative",
+          i18n: "notification.errors.invalidRestoreDate",
+          timeout: 3000
+        });
+        return;
+      }
+      fromHeight = height;
+    }
+    await this.stopSync();
     clearInterval(this.bnsHeartbeat);
     this.wallet_state.balance = null;
     this.wallet_state.unlocked_balance = null;
     this.wallet_state.height = 0;
     this.resetTxCache();
-    this.sendRPC("rescan_blockchain");
+    // rescan_blockchain clears the wallet and then refreshes inline; with
+    // block sync paused that refresh ends at once and the loop takes over.
+    this.proxy.pause();
+    await this.sendRPC("rescan_blockchain", { hard: false });
+    this.proxy.resume();
+    this.caughtUp = false;
+    this.setRescanFrom(fromHeight);
     this.startHeartbeat();
   }
 
@@ -3155,6 +3288,7 @@ export class WalletRPC {
   }
 
   async closeWallet() {
+    await this.stopSync();
     clearInterval(this.heartbeat);
     clearInterval(this.bnsHeartbeat);
     this.wallet_state = {
@@ -3172,9 +3306,10 @@ export class WalletRPC {
     this.purchasedNames = {};
     this.resetTxCache();
     this.history_refresh_pending = false;
+    this.caughtUp = false;
+    this.rescanFrom = null;
 
-    await this.saveWallet();
-    await this.sendRPC("close_wallet");
+    await this.sendRPC("close_wallet", { autosave_current: true });
   }
 
   sendGateway(method, data) {
@@ -3187,7 +3322,20 @@ export class WalletRPC {
     this.backend.send(method, data);
   }
 
-  sendRPC(method, params = {}, timeout = 0) {
+  // Background callers (BNS refreshes) pass { background: true }: they wait
+  // for the current scan chunk instead of ending it.
+  sendRPC(method, params = {}, timeout = 0, { background = false } = {}) {
+    // A scan holds wallet-rpc's only request thread: end the current chunk so
+    // this call is answered now (the sync loop then carries on).
+    if (this.refreshing && !background && method !== "refresh" && this.proxy) {
+      this.proxy.pause();
+    }
+    // Opening, creating or closing a wallet ends the current wallet's sync
+    // loop (the new wallet starts its own)
+    if (WALLET_SWITCH_METHODS.has(method)) {
+      this.syncGeneration++;
+      this.wakeSync();
+    }
     let id = this.id++;
     const url = `${this.protocol}${this.hostname}:${this.port}/json_rpc`;
     let payload = {
@@ -3248,38 +3396,25 @@ export class WalletRPC {
   }
 
   async quit() {
-    return new Promise(resolve => {
-      if (!this.walletRPCProcess) {
-        resolve();
-        return;
-      }
-
-      this.closeWallet().then(() => {
-        // however if the wallet is not responsive to RPC
-        // requests then we must forcefully close it below
-      });
-      setTimeout(() => {
-        if (this.walletRPCProcess) {
-          this.walletRPCProcess.on("close", () => {
-            this.agent.destroy();
-            clearTimeout(this.forceKill);
-            resolve();
-          });
-
-          // Force kill after 20 seconds
-          this.forceKill = setTimeout(() => {
-            if (this.walletRPCProcess) {
-              this.walletRPCProcess.kill("SIGKILL");
-            }
-          }, 20000);
-
-          // Force kill if the rpc is syncing
-          const signal = this.isRPCSyncing ? "SIGKILL" : "SIGTERM";
-          this.walletRPCProcess.kill(signal);
-        } else {
-          resolve();
+    const proc = this.walletRPCProcess;
+    if (proc && proc.exitCode === null) {
+      const exited = new Promise(resolve => proc.once("close", resolve));
+      const wait = ms =>
+        new Promise(resolve => setTimeout(resolve, ms, "timeout"));
+      // Ends a running scan and saves the wallet (see syncLoop)
+      await Promise.race([this.closeWallet().catch(() => {}), wait(20000)]);
+      // wallet-rpc only exits once idle keep-alive connections are gone
+      this.agent.destroy();
+      this.agent = new http.Agent({ keepAlive: false });
+      this.sendRPC("stop_wallet", {}, 5000);
+      if ((await Promise.race([exited, wait(10000)])) === "timeout") {
+        proc.kill("SIGTERM");
+        if ((await Promise.race([exited, wait(5000)])) === "timeout") {
+          proc.kill("SIGKILL");
         }
-      }, 2500);
-    });
+      }
+    }
+    this.agent.destroy();
+    if (this.proxy) await this.proxy.close();
   }
 }

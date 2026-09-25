@@ -51,9 +51,13 @@ const inputMenu = Menu.buildFromTemplate([
   { role: "selectall" }
 ]);
 
+// Backend WebSocket port. BELDEX_WS_PORT lets a development or test build run
+// next to an installed wallet, which holds the default port.
+const WS_PORT = Number(process.env.BELDEX_WS_PORT) || 12313;
+
 const rendererConnectSrc = [
   "'self'",
-  "ws://127.0.0.1:12313",
+  `ws://127.0.0.1:${WS_PORT}`,
   "https://api.beldex.dev",
   "https://api.changelly.com"
 ];
@@ -203,7 +207,7 @@ function createWindow() {
       if (err) throw err;
 
       let config = {
-        port: 12313,
+        port: WS_PORT,
         token: buffer.toString("hex")
       };
 
@@ -259,7 +263,7 @@ powerMonitor.on("suspend", () => {
 
 powerMonitor.on("resume", () => {
   let config = {
-    port: 12313,
+    port: WS_PORT,
     token: startingToken
   };
   sendToWindow("appResumed", config);

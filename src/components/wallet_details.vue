@@ -196,6 +196,36 @@
               />
             </div>
           </div>
+          <div class="r-btn-wrapper">
+            <div
+              :class="[
+                modals.rescan.type === 'from'
+                  ? 'radio-btn-box'
+                  : 'radio-btn-box-non-select',
+                'q-mt-lg',
+                'flex',
+                'items-center',
+                'ft-semibold',
+                'q-px-md'
+              ]"
+            >
+              <q-radio
+                v-model="modals.rescan.type"
+                val="from"
+                :label="$t('fieldLabels.rescanFromHeight')"
+              />
+            </div>
+          </div>
+          <q-input
+            v-if="modals.rescan.type === 'from'"
+            v-model="modals.rescan.from"
+            class="q-mt-md"
+            :dark="theme == 'dark'"
+            :placeholder="$t('placeholders.rescanFrom')"
+            borderless
+            dense
+            @keyup.enter="rescanWallet()"
+          />
 
           <div class="q-my-lg text-center">
             <q-btn
@@ -234,7 +264,8 @@ export default {
       modals: {
         rescan: {
           visible: false,
-          type: "full"
+          type: "full",
+          from: ""
         }
       }
     };
@@ -267,6 +298,28 @@ export default {
       this.modals[which].visible = false;
     },
     rescanWallet() {
+      if (this.modals.rescan.type == "from") {
+        // A block height, or a date (YYYY-MM-DD): blocks before it are skipped
+        const input = this.modals.rescan.from.trim().replace(/,/g, "");
+        const params = /^\d+$/.test(input)
+          ? { from_height: Number(input) }
+          : { from_timestamp: Date.parse(input) };
+        if (!params.from_height && !params.from_timestamp) {
+          this.$q.notify({
+            type: "negative",
+            timeout: 3000,
+            message: this.$t("notification.errors.invalidRescanFrom")
+          });
+          return;
+        }
+        this.hideModal("rescan");
+        this.$store.commit("gateway/set_wallet_data", {
+          info: { balance: 0, unlocked_balance: 0, height: 1 },
+          transactions: { tx_list: [] }
+        });
+        this.$gateway.send("wallet", "rescan_blockchain", params);
+        return;
+      }
       this.hideModal("rescan");
       if (this.modals.rescan.type == "full") {
         this.$q

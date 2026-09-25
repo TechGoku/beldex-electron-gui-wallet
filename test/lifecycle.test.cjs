@@ -41,7 +41,12 @@ function launch(home, port, tag, extraEnv = {}) {
     ELECTRON,
     [APP + "/dist/electron/UnPackaged", `--remote-debugging-port=${port}`],
     {
-      env: { ...cleanEnv(home), ...extraEnv },
+      // Own backend port, so an installed wallet can stay open meanwhile
+      env: {
+        ...cleanEnv(home),
+        BELDEX_WS_PORT: String(port + 3000),
+        ...extraEnv
+      },
       stdio: ["ignore", out, out],
       detached: true
     }
@@ -219,6 +224,14 @@ function freshHome(name) {
   fs.rmSync(home, { recursive: true, force: true });
   fs.mkdirSync(home, { recursive: true });
   return home;
+}
+
+// First "Blockchain sync progress" height wallet-rpc logged in a run's log
+function firstScanHeight(home, tag) {
+  const m = fs
+    .readFileSync(path.join(home, `${tag}.log`), "utf8")
+    .match(/Blockchain sync progress: <[0-9a-f]+>, height (\d+)/);
+  return m ? Number(m[1]) : null;
 }
 
 async function quitViaConfirm(page, proc, restart = false) {
@@ -486,6 +499,159 @@ const scenarios = {
     return `reused running beldexd; offered Local + Remote: "${text
       .replace(/\s+/g, " ")
       .slice(0, 90)}..."`;
+  },
+
+  // Rescan from a block height: the wallet clears, skips everything below the
+  // height and scans back up to the tip
+  async "rescan-from-height"() {
+    const home = freshHome("rescanfrom");
+    let proc = launch(home, 9349, "run1", { ELECTRON_IS_DEV: "0" });
+    let page = await Page.connect(9349);
+    await waitReady(page, { configure: remoteCfg });
+    await page.eval(
+      `(${VM}.$gateway.send("wallet","create_wallet",{name:"src",password:"pw",language:"English"}), true)`
+    );
+    const seed = await page.waitFor(
+      "seed",
+      `${G}.wallet.status.code === 0 && ${G}.wallet.secret.mnemonic`,
+      90000
+    );
+    const tip = await page.waitFor(
+      "node height",
+      `${G}.daemon.info.height`,
+      60000
+    );
+    await page.eval(`(${VM}.$gateway.send("wallet","close_wallet"), true)`);
+    await sleep(2000);
+    const restoreHeight = tip - 40000;
+    await page.eval(
+      `(${VM}.$gateway.send("wallet","restore_wallet",{name:"r",password:"pw",seed:${JSON.stringify(
+        seed
+      )},refresh_type:"height",refresh_start_height:${restoreHeight}}), true)`
+    );
+    await page.waitFor(
+      "synced",
+      `${G}.wallet.info.name === "r" && ${G}.wallet.info.height >= ${tip -
+        2} && !${G}.wallet.isRPCSyncing`,
+      300000
+    );
+
+    // Rescan from 10,000 blocks above the restore height, quit midway
+    const from = restoreHeight + 10000;
+    const t0 = Date.now();
+    await page.eval(
+      `(${VM}.$gateway.send("wallet","rescan_blockchain",{from_height:${from}}), true)`
+    );
+    await page.waitFor(
+      "cleared",
+      `${G}.wallet.info.height < ${from}`,
+      30000,
+      100
+    );
+    const quitAt = await page.waitFor(
+      "rescanning",
+      `${G}.wallet.info.height > ${from + 1500} && ${G}.wallet.info.height`,
+      120000,
+      100
+    );
+    if ((await quitViaConfirm(page, proc)) === "timeout") {
+      throw new Error("quit timed out");
+    }
+
+    // Relaunch: the rescan carries on from where it stopped
+    proc = launch(home, 9349, "run2", { ELECTRON_IS_DEV: "0" });
+    page = await Page.connect(9349);
+    await waitReady(page);
+    await page.eval(
+      `(${VM}.$gateway.send("wallet","open_wallet",{name:"r",password:"pw"}), true)`
+    );
+    await page.waitFor(
+      "rescan done",
+      `${G}.wallet.info.name === "r" && ${G}.wallet.info.height >= ${tip -
+        2} && !${G}.wallet.isRPCSyncing`,
+      240000,
+      200
+    );
+    const ms = Date.now() - t0;
+    if ((await quitViaConfirm(page, proc)) === "timeout") {
+      throw new Error("quit timed out");
+    }
+    const resumedFrom = firstScanHeight(home, "run2");
+    if (resumedFrom !== null && resumedFrom < from) {
+      throw new Error(
+        `after relaunch scanning restarted at ${resumedFrom} (rescan height ${from}, quit at ${quitAt})`
+      );
+    }
+    return `rescan from ${from} (restore height ${restoreHeight}): quit at ${quitAt}, resumed at ${resumedFrom}, done in ${ms} ms`;
+  },
+
+  // Quit in the middle of a scan, relaunch: the wallet carries on from where
+  // it stopped instead of rescanning from the restore height
+  async "resume-after-quit"() {
+    const home = freshHome("resume");
+    let proc = launch(home, 9348, "run1", { ELECTRON_IS_DEV: "0" });
+    let page = await Page.connect(9348);
+    await waitReady(page, { configure: remoteCfg });
+    await page.eval(
+      `(${VM}.$gateway.send("wallet","create_wallet",{name:"src",password:"pw",language:"English"}), true)`
+    );
+    const seed = await page.waitFor(
+      "seed",
+      `${G}.wallet.status.code === 0 && ${G}.wallet.secret.mnemonic`,
+      90000
+    );
+    const tip = await page.waitFor(
+      "node height",
+      `${G}.daemon.info.height`,
+      60000
+    );
+    await page.eval(`(${VM}.$gateway.send("wallet","close_wallet"), true)`);
+    await sleep(2000);
+
+    const restoreHeight = tip - 40000;
+    await page.eval(
+      `(${VM}.$gateway.send("wallet","restore_wallet",{name:"resume",password:"pw",seed:${JSON.stringify(
+        seed
+      )},refresh_type:"height",refresh_start_height:${restoreHeight}}), true)`
+    );
+    await page.waitFor("restored", `${G}.wallet.info.name === "resume"`, 90000);
+    const before = await page.waitFor(
+      "scan progress",
+      `(() => { const h = ${G}.wallet.info.height; return h > ${restoreHeight +
+        8000} && h; })()`,
+      300000,
+      250
+    );
+
+    const t0 = Date.now();
+    if ((await quitViaConfirm(page, proc)) === "timeout") {
+      throw new Error("quit timed out");
+    }
+    const quitMs = Date.now() - t0;
+    const left = leftovers(home);
+    if (left.length) throw new Error(`left running: ${left.join(" | ")}`);
+
+    proc = launch(home, 9348, "run2", { ELECTRON_IS_DEV: "0" });
+    page = await Page.connect(9348);
+    await waitReady(page);
+    await page.eval(
+      `(${VM}.$gateway.send("wallet","open_wallet",{name:"resume",password:"pw"}), true)`
+    );
+    await page.waitFor(
+      "synced after relaunch",
+      `${G}.wallet.info.name === "resume" && !${G}.wallet.isRPCSyncing && ${G}.wallet.info.height >= ${tip -
+        2}`,
+      240000,
+      200
+    );
+    await quitViaConfirm(page, proc);
+    const reopened = firstScanHeight(home, "run2");
+    if (reopened === null || reopened < restoreHeight + 6000) {
+      throw new Error(
+        `after relaunch scanning started at ${reopened}: progress lost (restore ${restoreHeight}, quit at ~${before})`
+      );
+    }
+    return `quit mid-scan at ~${before} in ${quitMs} ms; relaunch resumed scanning at ${reopened} (restore height ${restoreHeight})`;
   }
 };
 

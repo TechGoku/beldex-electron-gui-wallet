@@ -304,6 +304,7 @@ export default {
     oldPassword: "Old Password",
     rescanFullBlockchain: "Rescan Full Blockchain",
     rescanSpentOutputs: "Rescan Spent Outputs",
+    rescanFromHeight: "Rescan From Block Height or Date (fastest)",
     transactionNotes: "Transaction Notes",
     totalBalance: "Total Balance",
     chooseNetwork: "Choose a Network",
@@ -433,6 +434,8 @@ export default {
       invalidPrivateViewKey: "Invalid private viewkey",
       invalidPublicAddress: "Invalid public address",
       invalidRestoreDate: "Invalid restore date",
+      invalidRescanFrom:
+        "Enter a block height (e.g. 5700000) or a date (YYYY-MM-DD)",
       invalidRestoreHeight: "Invalid restore height",
       invalidSeedLength: "Invalid seed word length",
       invalidMasterNodeCommand:
@@ -467,6 +470,8 @@ export default {
     }
   },
   placeholders: {
+    rescanFrom:
+      "Block height or date (YYYY-MM-DD) after the wallet's restore height",
     additionalNotes: "Additional notes",
     addNotesOptional: "Add notes (optional)",
     addressBookName: "Name that belongs to this address",
