@@ -357,6 +357,7 @@ export class Backend {
         break;
       case "save_config_init":
       case "save_config": {
+        const before = JSON.parse(JSON.stringify(this.config_data));
         if (data.method === "save_config") {
           Object.keys(this.config_data).map(i => {
             if (i == "appearance") return;
@@ -400,7 +401,10 @@ export class Backend {
               config: this.config_data,
               pending_config: this.config_data
             });
-            if (config_changed) {
+            if (config_changed && this.onlyNodeChanged(before)) {
+              // Same network, different node: switch live, no restart
+              this.switchNode(before);
+            } else if (config_changed) {
               this.send("settings_changed_reboot");
             }
           }
@@ -950,7 +954,141 @@ export class Backend {
     }
   }
 
+  // ---- live node switching and recovery ------------------------------------
+
+  // True when only the current network's node settings differ from `before`
+  onlyNodeChanged(before) {
+    const net = before.app.net_type;
+    if (this.config_data.app.net_type !== net) return false;
+    const strip = c => {
+      const copy = JSON.parse(JSON.stringify(c));
+      delete copy.appearance;
+      delete copy.daemons[net];
+      return JSON.stringify(copy);
+    };
+    return strip(before) === strip(this.config_data);
+  }
+
+  nodeTarget(daemon) {
+    return daemon.type === "remote"
+      ? [daemon.remote_host, daemon.remote_port]
+      : [daemon.rpc_bind_ip, daemon.rpc_bind_port];
+  }
+
+  // Applies the current network's node settings without restarting: the
+  // open wallet stays open and keeps syncing from the same block. If the node
+  // doesn't answer, the previous settings are put back.
+  async switchNode(before) {
+    const net = this.config_data.app.net_type;
+    const daemon = this.config_data.daemons[net];
+    try {
+      await this.daemon.switchTo(this.config_data);
+      if (this.walletd) this.walletd.setNode(...this.nodeTarget(daemon));
+      const label =
+        daemon.type === "remote"
+          ? `${daemon.remote_host}:${daemon.remote_port}`
+          : "your local node";
+      this.send("show_notification", {
+        type: "positive",
+        message: `Now using ${label}`,
+        timeout: 3000
+      });
+    } catch (e) {
+      this.config_data.daemons[net] = before.daemons[net];
+      this.writeConfig();
+      this.send("set_app_data", {
+        config: this.config_data,
+        pending_config: this.config_data
+      });
+      this.send("show_notification", {
+        type: "negative",
+        message: `Could not use that node: ${e.message}`,
+        timeout: 5000
+      });
+    }
+  }
+
+  // The remote node stopped answering: move to a working public node
+  async onDaemonUnreachable() {
+    const net = this.config_data.app.net_type;
+    const daemon = this.config_data.daemons[net];
+    if (this.failingOver || this.quitting || daemon.type !== "remote") return;
+    this.failingOver = true;
+    try {
+      const previous = daemon.remote_host;
+      const next = await this.daemon.findWorkingRemote(
+        this.remotes.filter(r => r.host !== previous),
+        net
+      );
+      if (!next) return;
+      const before = JSON.parse(JSON.stringify(this.config_data));
+      daemon.remote_host = next.host;
+      daemon.remote_port = next.port;
+      this.writeConfig();
+      this.send("set_app_data", {
+        config: this.config_data,
+        pending_config: this.config_data
+      });
+      await this.switchNode(before);
+      this.send("show_notification", {
+        type: "warning",
+        textColor: "black",
+        message: `${previous} stopped answering; switched to ${next.host}`,
+        timeout: 5000
+      });
+    } catch (e) {
+      // Keep the current node; the next failed check tries again
+    } finally {
+      this.failingOver = false;
+    }
+  }
+
+  // A local beldexd exited without being asked to: start it again
+  async onLocalDaemonExit(code) {
+    if (this.quitting) return;
+    this.send("show_notification", {
+      type: "warning",
+      textColor: "black",
+      message: `The local node stopped unexpectedly (${code}) and is restarting`,
+      timeout: 5000
+    });
+    try {
+      await this.daemon.start(this.config_data);
+    } catch (e) {
+      this.send("show_notification", {
+        type: "negative",
+        message: `Could not restart the local node: ${e.message}`,
+        timeout: 8000
+      });
+    }
+  }
+
+  // wallet-rpc exited without being asked to: start a new one; an open
+  // wallet goes back to the wallet list (its saved progress is kept)
+  async onWalletRpcExit(code) {
+    if (this.quitting) return;
+    try {
+      const wasOpen = await this.walletd.recoverFromCrash(this.config_data);
+      this.walletd.listWallets();
+      if (wasOpen) {
+        this.send("return_to_wallet_select");
+        this.send("show_notification", {
+          type: "negative",
+          message: `The wallet service stopped unexpectedly (${code}) and was restarted. Open your wallet again.`,
+          timeout: 8000
+        });
+      }
+    } catch (e) {
+      this.send("show_notification", {
+        type: "negative",
+        message: `The wallet service stopped and could not be restarted: ${e.message}`,
+        timeout: 0
+      });
+    }
+  }
+
   quit() {
+    this.quitting = true;
     return new Promise(resolve => {
       let process = [];
       if (this.daemon) {

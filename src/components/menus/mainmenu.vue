@@ -192,7 +192,6 @@ export default {
   },
   computed: mapState({
     theme: state => state.gateway.app.config.appearance.theme,
-    isRPCSyncing: state => state.gateway.wallet.isRPCSyncing,
     daemon: state => state.gateway.daemon,
     daemonVersion() {
       return this.daemon.info.version || "N/A";
@@ -213,25 +212,8 @@ export default {
       this.$refs.settingsModal.isVisible = true;
     },
     switchWallet() {
-      // If the rpc is syncing then we want to tell the user to restart
-      if (this.isRPCSyncing) {
-        this.$gateway.confirmClose(
-          this.$t("dialog.switchWallet.restartMessage"),
-          true
-        );
-        return;
-      }
-
-      // TODO: Remove this in hardfork 16
-      // This is a temporary work around for the issue where wallet rpc hangs after closing a wallet due to long polling still being active
-      this.$gateway.confirmClose(
-        this.$t("dialog.switchWallet.restartWalletMessage"),
-        true
-      );
-
-      // Allow switching normally because rpc won't be blocked
-      // NB: If this is added back, must use the quasar v1 APIs
-      /*
+      // Closing ends a running scan and saves it, so switching needs no
+      // restart and loses no sync progress
       this.$q
         .dialog({
           title: this.$t("dialog.switchWallet.title"),
@@ -245,17 +227,15 @@ export default {
             color: this.theme == "dark" ? "white" : "dark"
           }
         })
-        .then(() => {
+        .onOk(() => {
           this.$router.replace({ path: "/wallet-select" });
           this.$gateway.send("wallet", "close_wallet");
           setTimeout(() => {
-            // short delay to prevent wallet data reaching the
-            // websocket moments after we close and reset data
+            // short delay so wallet data sent just before the close doesn't
+            // land after the reset
             this.$store.dispatch("gateway/resetWalletData");
           }, 250);
-        })
-        .catch(() => {});
-       */
+        });
     },
     exit() {
       this.$gateway.confirmClose(this.$t("dialog.exit.message"));

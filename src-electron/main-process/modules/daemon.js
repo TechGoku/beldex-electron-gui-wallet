@@ -218,11 +218,15 @@ export class Daemon {
             this.daemonProcess.on("error", err =>
               process.stderr.write(`Daemon: ${err}`)
             );
-            this.daemonProcess.on("close", code => {
+            const proc = this.daemonProcess;
+            proc.on("close", code => {
               process.stderr.write(`Daemon: exited with code ${code} \n`);
-              this.daemonProcess = null;
-              this.agent.destroy();
-              if (code === null) {
+              if (this.daemonProcess === proc) this.daemonProcess = null;
+              if (this.runningProcess === proc) {
+                // Not asked to stop: let the backend restart it
+                this.runningProcess = null;
+                this.backend.onLocalDaemonExit(code);
+              } else if (code === null) {
                 reject(new Error("Failed to start local daemon"));
               }
             });
@@ -232,6 +236,7 @@ export class Daemon {
             let intrvl = setInterval(() => {
               this.sendRPC("get_info").then(data => {
                 if (!data.hasOwnProperty("error")) {
+                  this.runningProcess = proc;
                   this.startHeartbeat();
                   clearInterval(intrvl);
                   resolve();
@@ -268,6 +273,75 @@ export class Daemon {
             });
           }
         });
+    });
+  }
+
+  // Switches to the node in `options` (same network) without touching the
+  // wallet. A remote node is checked first: if it doesn't answer or is on
+  // another network this throws and nothing changes. A local node is
+  // (re)started.
+  async switchTo(options) {
+    const { net_type } = options.app;
+    const daemon = options.daemons[net_type];
+    if (daemon.type === "remote") {
+      const check = await this.sendRPC(
+        "get_info",
+        {},
+        {
+          hostname: daemon.remote_host,
+          port: daemon.remote_port,
+          timeout: 15000
+        }
+      );
+      if (check.error) {
+        throw new Error(
+          `${daemon.remote_host}:${daemon.remote_port} is not answering`
+        );
+      }
+      const nettype = check.result.nettype;
+      if (nettype && nettype !== net_type) {
+        throw new Error(`that node is on ${nettype}, not ${net_type}`);
+      }
+      this.stopHeartbeats();
+      this.local = false;
+      this.type = "remote";
+      this.protocol = "http://";
+      this.hostname = daemon.remote_host;
+      this.port = daemon.remote_port;
+      this.failedChecks = 0;
+      this.info = check.result;
+      this.sent = {};
+      // A local node isn't needed any more; let it shut down in the background
+      this.stopProcess();
+      this.startHeartbeat();
+      return;
+    }
+    this.stopHeartbeats();
+    await this.stopProcess();
+    this.sent = {};
+    await this.start(options);
+  }
+
+  stopHeartbeats() {
+    clearInterval(this.heartbeat);
+    clearInterval(this.heartbeat_slow);
+    clearInterval(this.masterNodeHeartbeat);
+  }
+
+  // Stops a local beldexd gracefully: SIGTERM, then SIGKILL after 20 s. (Killing
+  // a node outright risks its database, so even a syncing node gets SIGTERM.)
+  stopProcess() {
+    const proc = this.daemonProcess;
+    this.runningProcess = null;
+    this.daemonProcess = null;
+    if (!proc || proc.exitCode !== null) return Promise.resolve();
+    return new Promise(resolve => {
+      const force = setTimeout(() => proc.kill("SIGKILL"), 20000);
+      proc.once("close", () => {
+        clearTimeout(force);
+        resolve();
+      });
+      proc.kill("SIGTERM");
     });
   }
 
@@ -448,6 +522,12 @@ export class Daemon {
     }
 
     Promise.all(actions).then(data => {
+      // A remote node that stops answering: the backend fails over
+      if (!this.local) {
+        const ok = data.some(n => n && n.method === "get_info" && n.result);
+        if (ok) this.failedChecks = 0;
+        else if (++this.failedChecks === 2) this.backend.onDaemonUnreachable();
+      }
       let daemon_info = {};
       for (let n of data) {
         if (
@@ -707,29 +787,7 @@ export class Daemon {
   }
 
   quit() {
-    clearInterval(this.heartbeat);
-    clearInterval(this.heartbeat_slow);
-    clearInterval(this.masterNodeHeartbeat);
-    return new Promise(resolve => {
-      if (this.daemonProcess) {
-        this.daemonProcess.on("close", () => {
-          this.agent.destroy();
-          clearTimeout(this.forceKill);
-          resolve();
-        });
-
-        // Force kill after 20 seconds
-        this.forceKill = setTimeout(() => {
-          if (this.daemonProcess) {
-            this.daemonProcess.kill("SIGKILL");
-          }
-        }, 20000);
-
-        const signal = this.isDaemonSyncing ? "SIGKILL" : "SIGTERM";
-        this.daemonProcess.kill(signal);
-      } else {
-        resolve();
-      }
-    });
+    this.stopHeartbeats();
+    return this.stopProcess().then(() => this.agent.destroy());
   }
 }

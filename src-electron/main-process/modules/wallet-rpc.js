@@ -76,12 +76,15 @@ export class WalletRPC {
     this.caughtUp = false;
     this.rescanFrom = null;
     this.last_progress_send_time = 0;
+    // wallet-rpc started and not being stopped (see onWalletRpcExit)
+    this.running = false;
   }
 
   // this function will take an options object for testnet, data-dir, etc
   start(options) {
     const { net_type } = options.app;
     const daemon = options.daemons[net_type];
+    this.agent = new http.Agent({ keepAlive: true, maxSockets: 10 });
     return new Promise((resolve, reject) => {
       const upstream =
         daemon.type == "remote"
@@ -221,11 +224,16 @@ export class WalletRPC {
                 this.walletRPCProcess.on("error", err =>
                   process.stderr.write(`Wallet: ${err}`)
                 );
-                this.walletRPCProcess.on("close", code => {
+                const proc = this.walletRPCProcess;
+                proc.on("close", code => {
                   process.stderr.write(`Wallet: exited with code ${code} \n`);
-                  this.walletRPCProcess = null;
-                  this.agent.destroy();
-                  if (code === null) {
+                  if (this.walletRPCProcess === proc)
+                    this.walletRPCProcess = null;
+                  if (this.running) {
+                    // Not asked to stop: the backend restarts it
+                    this.running = false;
+                    this.backend.onWalletRpcExit(code);
+                  } else if (code === null) {
                     reject(new Error("Failed to start wallet RPC"));
                   }
                 });
@@ -236,8 +244,11 @@ export class WalletRPC {
                     if (!data.hasOwnProperty("error")) {
                       clearInterval(intrvl);
                       // The app drives refreshes itself (see syncLoop)
-                      this.sendRPC("auto_refresh", { enable: false }).then(() =>
-                        resolve()
+                      this.sendRPC("auto_refresh", { enable: false }).then(
+                        () => {
+                          this.running = true;
+                          resolve();
+                        }
                       );
                     } else {
                       if (
@@ -534,24 +545,50 @@ export class WalletRPC {
     return response;
   }
 
-  derivePasswordHash(password, callback) {
+  // Checks against the stored hash (isValidPasswordHash) must not run before
+  // it exists, so callbacks wait for a hash still being computed by
+  // rememberPassword. `stored` is that computation itself.
+  derivePasswordHash(password, callback, { stored = false } = {}) {
     crypto.pbkdf2(
       password,
       this.auth[2],
       PASSWORD_HASH_PBKDF2_ITERATIONS,
       PASSWORD_HASH_KEY_LENGTH,
       PASSWORD_HASH_DIGEST,
-      callback
+      (err, hash) => {
+        if (stored) return callback(err, hash);
+        Promise.resolve(this.password_hash_pending).then(() =>
+          callback(err, hash)
+        );
+      }
     );
   }
 
-  derivePasswordHashHex(password) {
+  derivePasswordHashHex(password, options = {}) {
     return new Promise((resolve, reject) => {
-      this.derivePasswordHash(password, (err, hash) => {
-        if (err) reject(err);
-        else resolve(hash.toString("hex"));
-      });
+      this.derivePasswordHash(
+        password,
+        (err, hash) => {
+          if (err) reject(err);
+          else resolve(hash.toString("hex"));
+        },
+        options
+      );
     });
+  }
+
+  // Hashes the open wallet's password in the background, so opening a
+  // wallet doesn't wait ~0.5 s for PBKDF2 before anything else happens
+  rememberPassword(password) {
+    this.wallet_state.password_hash = null;
+    const pending = this.derivePasswordHashHex(password, { stored: true })
+      .then(hash => {
+        if (this.password_hash_pending === pending) {
+          this.wallet_state.password_hash = hash;
+        }
+      })
+      .catch(() => {});
+    this.password_hash_pending = pending;
   }
 
   isValidPasswordHash(password_hash) {
@@ -563,7 +600,8 @@ export class WalletRPC {
     return this.wallet_state.password_hash === hash;
   }
 
-  hasPassword() {
+  async hasPassword() {
+    await this.password_hash_pending;
     if (this.wallet_state.password_hash === null) {
       this.sendGateway("set_has_password", false);
       return;
@@ -623,9 +661,7 @@ export class WalletRPC {
       }
 
       // store hash of the password so we can check against it later when requesting private keys, or for sending txs
-      this.wallet_state.password_hash = await this.derivePasswordHashHex(
-        password
-      );
+      this.rememberPassword(password);
       this.wallet_state.name = filename;
       this.wallet_state.open = true;
 
@@ -683,9 +719,7 @@ export class WalletRPC {
       }
 
       // store hash of the password so we can check against it later when requesting private keys, or for sending txs
-      this.wallet_state.password_hash = await this.derivePasswordHashHex(
-        password
-      );
+      this.rememberPassword(password);
       this.wallet_state.name = filename;
       this.wallet_state.open = true;
 
@@ -751,9 +785,7 @@ export class WalletRPC {
       }
 
       // store hash of the password so we can check against it later when requesting private keys, or for sending txs
-      this.wallet_state.password_hash = await this.derivePasswordHashHex(
-        password
-      );
+      this.rememberPassword(password);
       this.wallet_state.name = filename;
       this.wallet_state.open = true;
 
@@ -819,9 +851,7 @@ export class WalletRPC {
       }
 
       // store hash of the password so we can check against it later when requesting private keys, or for sending txs
-      this.wallet_state.password_hash = await this.derivePasswordHashHex(
-        password
-      );
+      this.rememberPassword(password);
       this.wallet_state.name = filename;
       this.wallet_state.open = true;
 
@@ -897,9 +927,7 @@ export class WalletRPC {
             return;
           }
           // store hash of the password so we can check against it later when requesting private keys, or for sending txs
-          this.wallet_state.password_hash = await this.derivePasswordHashHex(
-            password
-          );
+          this.rememberPassword(password);
           this.wallet_state.name = wallet_name;
           this.wallet_state.open = true;
           this.finalizeNewWallet(wallet_name);
@@ -1015,9 +1043,7 @@ export class WalletRPC {
       }
 
       // store hash of the password so we can check against it later when requesting private keys, or for sending txs
-      this.wallet_state.password_hash = await this.derivePasswordHashHex(
-        password
-      );
+      this.rememberPassword(password);
       this.wallet_state.name = filename;
       this.wallet_state.open = true;
 
@@ -1099,38 +1125,44 @@ export class WalletRPC {
       this.proxy.resume();
       if (generation !== this.syncGeneration) break;
 
-      await this.heartbeatAction();
-      if (!current()) break;
+      // Anything unexpected below must not end syncing for this wallet
+      try {
+        await this.heartbeatAction();
+        if (!current()) break;
 
-      const error = data.hasOwnProperty("error");
-      const caughtUp = !error && !interrupted;
-      if (caughtUp !== this.caughtUp) {
-        this.caughtUp = caughtUp;
-        this.isRPCSyncing = !caughtUp;
-        this.sendGateway("set_wallet_data", { isRPCSyncing: !caughtUp });
-        if (caughtUp) this.updateLocalBNSRecords();
-      }
-      // "Rescan from height" passes start_height until the wallet reaches it
-      // (wallet2 skips blocks below the wallet's own restore height anyway)
-      if (this.rescanFrom && this.wallet_state.height >= this.rescanFrom) {
-        this.setRescanFrom(null);
-      }
-      // Save regularly while scanning (crash / power loss) and once caught up
-      if (
-        this.wallet_state.height > savedHeight &&
-        (caughtUp || Date.now() - lastSave >= SAVE_EVERY_MS)
-      ) {
-        await this.sendRPC("store");
-        lastSave = Date.now();
-        savedHeight = this.wallet_state.height;
-      }
-      if (caughtUp) {
-        failures = 0;
-        await this.idle(IDLE_POLL_MS, generation);
-      } else if (error && !interrupted) {
-        // Node unreachable or busy: back off, but keep trying
-        failures++;
-        await this.idle(Math.min(30000, 2000 * failures), generation);
+        const error = data.hasOwnProperty("error");
+        const caughtUp = !error && !interrupted;
+        if (caughtUp !== this.caughtUp) {
+          this.caughtUp = caughtUp;
+          this.isRPCSyncing = !caughtUp;
+          this.sendGateway("set_wallet_data", { isRPCSyncing: !caughtUp });
+          if (caughtUp) this.updateLocalBNSRecords();
+        }
+        // "Rescan from height" passes start_height until the wallet reaches it
+        // (wallet2 skips blocks below the wallet's own restore height anyway)
+        if (this.rescanFrom && this.wallet_state.height >= this.rescanFrom) {
+          this.setRescanFrom(null);
+        }
+        // Save regularly while scanning (crash / power loss) and once caught up
+        if (
+          this.wallet_state.height > savedHeight &&
+          (caughtUp || Date.now() - lastSave >= SAVE_EVERY_MS)
+        ) {
+          await this.sendRPC("store");
+          lastSave = Date.now();
+          savedHeight = this.wallet_state.height;
+        }
+        if (caughtUp) {
+          failures = 0;
+          await this.idle(IDLE_POLL_MS, generation);
+        } else if (error && !interrupted) {
+          // Node unreachable or busy: back off, but keep trying
+          failures++;
+          await this.idle(Math.min(30000, 2000 * failures), generation);
+        }
+      } catch (e) {
+        console.debug("Wallet sync loop error: ", e);
+        await this.idle(5000, generation);
       }
     }
   }
@@ -1194,6 +1226,47 @@ export class WalletRPC {
       }, ms);
       this.syncWake = wake;
     });
+  }
+
+  // Points wallet-rpc at another node without restarting it or closing the
+  // wallet: the current scan chunk ends and the next one continues from the
+  // same block on the new node.
+  setNode(host, port) {
+    if (!this.proxy) return;
+    this.proxy.setTarget(host, port);
+    if (this.refreshing) this.proxy.pause(); // the sync loop resumes it
+    this.wakeSync();
+  }
+
+  // wallet-rpc exited unexpectedly: start a new one. An open wallet is closed
+  // (its progress up to the last save is kept); the user opens it again.
+  // Resolves with whether a wallet was open.
+  async recoverFromCrash(options) {
+    const wasOpen = this.wallet_state.open;
+    this.syncGeneration++;
+    this.refreshing = false;
+    clearInterval(this.heartbeat);
+    clearInterval(this.bnsHeartbeat);
+    this.wallet_state = {
+      open: false,
+      name: "",
+      password_hash: null,
+      balance: null,
+      unlocked_balance: null,
+      height: 0,
+      address: "",
+      bnsRecords: [],
+      view_only: false
+    };
+    this.password_hash_pending = null;
+    this.purchasedNames = {};
+    this.resetTxCache();
+    this.caughtUp = false;
+    this.rescanFrom = null;
+    if (this.proxy) await this.proxy.close();
+    this.queue = new queue(1, Infinity);
+    await this.start(options);
+    return wasOpen;
   }
 
   // Live scan progress from the block responses the proxy sees
@@ -3308,6 +3381,7 @@ export class WalletRPC {
     this.history_refresh_pending = false;
     this.caughtUp = false;
     this.rescanFrom = null;
+    this.password_hash_pending = null;
 
     await this.sendRPC("close_wallet", { autosave_current: true });
   }
@@ -3396,6 +3470,7 @@ export class WalletRPC {
   }
 
   async quit() {
+    this.running = false;
     const proc = this.walletRPCProcess;
     if (proc && proc.exitCode === null) {
       const exited = new Promise(resolve => proc.once("close", resolve));

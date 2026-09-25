@@ -260,7 +260,7 @@ async function check(name, fn) {
     spawnSync("pkill", [
       "-9",
       "-f",
-      "dist/electron --remote-debugging-port=934"
+      "dist/electron --remote-debugging-port=93"
     ]);
     spawnSync("pkill", ["-9", "-f", `(wallet-rpc|beldexd) .*${HOME_BASE}-`]);
     await sleep(1500);
@@ -499,6 +499,153 @@ const scenarios = {
     return `reused running beldexd; offered Local + Remote: "${text
       .replace(/\s+/g, " ")
       .slice(0, 90)}..."`;
+  },
+
+  // Change the node in settings while the wallet scans: no restart, the
+  // wallet stays open and keeps scanning on the new node
+  async "switch-node-live"() {
+    const home = freshHome("switchnode");
+    const proc = launch(home, 9350, "app", { ELECTRON_IS_DEV: "0" });
+    const page = await Page.connect(9350);
+    await waitReady(page, { configure: remoteCfg });
+    await page.eval(
+      `(${VM}.$gateway.send("wallet","create_wallet",{name:"src",password:"pw",language:"English"}), true)`
+    );
+    const seed = await page.waitFor(
+      "seed",
+      `${G}.wallet.status.code === 0 && ${G}.wallet.secret.mnemonic`,
+      90000
+    );
+    const tip = await page.waitFor(
+      "node height",
+      `${G}.daemon.info.height`,
+      60000
+    );
+    await page.eval(`(${VM}.$gateway.send("wallet","close_wallet"), true)`);
+    await sleep(2000);
+    const restoreHeight = tip - 40000;
+    await page.eval(
+      `(${VM}.$gateway.send("wallet","restore_wallet",{name:"sw",password:"pw",seed:${JSON.stringify(
+        seed
+      )},refresh_type:"height",refresh_start_height:${restoreHeight}}), true)`
+    );
+    const before = await page.waitFor(
+      "scanning",
+      `${G}.wallet.info.name === "sw" && ${G}.wallet.info.height > ${restoreHeight +
+        3000} && ${G}.wallet.info.height`,
+      180000,
+      100
+    );
+
+    const current = await page.eval(
+      `${G}.app.config.daemons.mainnet.remote_host`
+    );
+    const other = [1, 2, 3, 4, 5]
+      .map(n => `publicnode${n}.rpcnode.stream`)
+      .find(h => h !== current);
+    const t0 = Date.now();
+    await page.eval(
+      `(() => { const vm=${VM}; const cfg = JSON.parse(JSON.stringify(vm.$store.state.gateway.app.config)); cfg.daemons.mainnet.remote_host = ${JSON.stringify(
+        other
+      )}; vm.$gateway.send("core","save_config", cfg); return true; })()`
+    );
+    await page.waitFor(
+      "switched",
+      `${G}.app.config.daemons.mainnet.remote_host === ${JSON.stringify(
+        other
+      )}`,
+      30000,
+      100
+    );
+    const switchMs = Date.now() - t0;
+    await page.waitFor(
+      "still scanning after the switch",
+      `${G}.wallet.info.name === "sw" && ${G}.wallet.info.height > ${before +
+        3000}`,
+      120000,
+      100
+    );
+    if (proc.exitCode !== null) throw new Error("app restarted");
+    await page.waitFor(
+      "synced",
+      `${G}.wallet.info.height >= ${tip - 2} && !${G}.wallet.isRPCSyncing`,
+      240000,
+      200
+    );
+    if ((await quitViaConfirm(page, proc)) === "timeout") {
+      throw new Error("quit timed out");
+    }
+    return `switched ${current} -> ${other} at ${before} in ${switchMs} ms without a restart; kept scanning to the tip`;
+  },
+
+  // Switch wallets without restarting, time open/close, then kill wallet-rpc:
+  // the app restarts it, returns to the wallet list and the wallet reopens
+  async "wallet-switch-and-rpc-crash"() {
+    const home = freshHome("crash");
+    const proc = launch(home, 9351, "app", { ELECTRON_IS_DEV: "0" });
+    const page = await Page.connect(9351);
+    await waitReady(page, { configure: remoteCfg });
+    for (const name of ["a", "b"]) {
+      await page.eval(
+        `(${VM}.$gateway.send("wallet","create_wallet",{name:"${name}",password:"pw",language:"English"}), true)`
+      );
+      await page.waitFor(
+        `created ${name}`,
+        `${G}.wallet.status.code === 0 && ${G}.wallet.info.name === "${name}" && ${G}.wallet.info.height > 1`,
+        90000
+      );
+      if (name === "a") {
+        // same steps as the menu's "Switch wallet" (no restart)
+        await page.eval(
+          `(${VM}.$router.replace({ path: "/wallet-select" }), ${VM}.$gateway.send("wallet","close_wallet"), setTimeout(() => ${VM}.$store.dispatch("gateway/resetWalletData"), 250), true)`
+        );
+        await sleep(1500);
+      }
+    }
+    // Switch b -> a and time it
+    const t0 = Date.now();
+    await page.eval(
+      `(${VM}.$router.replace({ path: "/wallet-select" }), ${VM}.$gateway.send("wallet","close_wallet"), setTimeout(() => ${VM}.$store.dispatch("gateway/resetWalletData"), 250), true)`
+    );
+    await page.waitFor("closed", `!${G}.wallet.info.name`, 20000, 50);
+    const closeMs = Date.now() - t0;
+    const t1 = Date.now();
+    await page.eval(
+      `(${VM}.$gateway.send("wallet","open_wallet",{name:"a",password:"pw"}), true)`
+    );
+    await page.waitFor(
+      "opened a",
+      `${G}.wallet.info.name === "a" && ${G}.wallet.info.height > 1`,
+      30000,
+      50
+    );
+    const openMs = Date.now() - t1;
+
+    // Kill wallet-rpc: recovered to the wallet list, wallet opens again
+    spawnSync("pkill", ["-9", "-f", `beldex-wallet-rpc.*${home}/`]);
+    await page.waitFor(
+      "back to the wallet list",
+      `${VM}.$route.path === "/wallet-select"`,
+      30000,
+      200
+    );
+    await sleep(1000);
+    await page.eval(
+      `(${VM}.$gateway.send("wallet","open_wallet",{name:"a",password:"pw"}), true)`
+    );
+    await page.waitFor(
+      "reopened after the crash",
+      `${G}.wallet.info.name === "a" && ${G}.wallet.info.height > 1`,
+      60000,
+      200
+    );
+    if (proc.exitCode !== null) throw new Error("app exited");
+    if ((await quitViaConfirm(page, proc)) === "timeout") {
+      throw new Error("quit timed out");
+    }
+    const left = leftovers(home);
+    if (left.length) throw new Error(`left running: ${left.join(" | ")}`);
+    return `switch wallet: close ${closeMs} ms, open ${openMs} ms (no restart); recovered from a killed wallet-rpc and reopened`;
   },
 
   // Rescan from a block height: the wallet clears, skips everything below the
